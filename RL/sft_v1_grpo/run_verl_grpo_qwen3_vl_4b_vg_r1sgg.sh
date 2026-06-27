@@ -69,7 +69,7 @@ if [ -z "${SWANLAB_API_KEY:-}" ]; then
     echo "Set SWANLAB_API_KEY before running training." >&2
     exit 1
 fi
-export SWANLAB_API_KEY
+export SWANLAB_API_KEY=OyVZPve2Ckn6i51nZdLHs
 export SWANLAB_LOG_DIR=${SWANLAB_LOG_DIR:-${ROOT}/output/swanlog}
 export SWANLAB_MODE=${SWANLAB_MODE:-cloud}
 
