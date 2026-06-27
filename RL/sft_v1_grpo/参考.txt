@@ -1,0 +1,7 @@
+对比实验之一：sft(无cot)+rl
+MODEL_PATH：第一阶段的无cot的sft模型
+REWARD_FILE：奖励函数位置 使用无cot奖励  vg_relation_no_clue
+
+DATA_DIR：数据地址，在modelscope上下载  verl_rl_56k
+
+8卡时间大约跑完需要2天不到，如果运行时间太长可能考虑做一下拒绝采用，或者做一下课程学习筛数据
