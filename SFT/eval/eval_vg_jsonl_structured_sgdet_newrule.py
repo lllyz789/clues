@@ -30,8 +30,36 @@ import eval_vg_jsonl_sgdet as base
 
 
 DEFAULT_PRED_JSONL = (
-    "/root/autodl-tmp/lyz/output/erejin_sft/sft_v2-20260626-014804_ckpt3514_v2_test500_pred.jsonl"
+    "/root/autodl-tmp/lyz/output/erejin_sft/new_acl/sft_v2-20260626-234146_ckpt1758_v2_temp_0.1_test500_pred.jsonl"
 )
+
+# Conservative canonical aliases used only for this evaluator. Both predicted
+# labels and GT labels are mapped through these tables before SGDET matching.
+OBJECT_CANONICAL_ALIASES = {
+    "airplane": "plane",
+    "boy": "person",
+    "child": "person",
+    "girl": "person",
+    "guy": "person",
+    "kid": "person",
+    "lady": "person",
+    "man": "person",
+    "men": "person",
+    "people": "person",
+    "player": "person",
+    "skier": "person",
+    "woman": "person",
+    "boot": "shoe",
+    "sneaker": "shoe",
+    "cap": "hat",
+    "jean": "pant",
+    "short": "pant",
+}
+
+PREDICATE_CANONICAL_ALIASES = {
+    "wears": "wearing",
+    "laying on": "lying on",
+}
 
 
 def _loads_jsonish(payload: str):
@@ -132,6 +160,22 @@ def parse_object_image_id(record):
     return None
 
 
+def build_index_aliases(ind_to_names, canonical_aliases):
+    name_to_idx = {base.normalize_text(name): idx for idx, name in enumerate(ind_to_names)}
+    idx_aliases = {idx: idx for idx in range(len(ind_to_names))}
+    for source, target in canonical_aliases.items():
+        source_idx = name_to_idx.get(base.normalize_text(source))
+        target_idx = name_to_idx.get(base.normalize_text(target))
+        if source_idx is not None and target_idx is not None:
+            idx_aliases[source_idx] = target_idx
+    return idx_aliases
+
+
+def canonicalize_predicate_name(name, pred_to_idx):
+    canonical = PREDICATE_CANONICAL_ALIASES.get(base.normalize_text(name), name)
+    return canonical if canonical in pred_to_idx else name
+
+
 def convert_pred_box(box, pred_box_scale, image_info, coord_mode):
     if not isinstance(box, (list, tuple)) or len(box) != 4:
         return None
@@ -165,9 +209,11 @@ def convert_pred_box(box, pred_box_scale, image_info, coord_mode):
 
 
 class StanfordFilteredVGDataset:
-    def __init__(self, vg_dir, image_ids, split_id=0):
+    def __init__(self, vg_dir, image_ids, split_id=0, object_idx_aliases=None, predicate_idx_aliases=None):
         self.vg_dir = vg_dir
         self.ind_to_classes, self.ind_to_predicates = base.build_ind_to_names(vg_dir)
+        self.object_idx_aliases = object_idx_aliases or {}
+        self.predicate_idx_aliases = predicate_idx_aliases or {}
         self.ids = []
         self.annotations = []
 
@@ -205,12 +251,20 @@ class StanfordFilteredVGDataset:
                     boxes = boxes.astype(np.float32, copy=True)
 
                 labels = all_labels[first_box : last_box + 1]
+                relation_labels = np.asarray(
+                    [self.object_idx_aliases.get(int(label), int(label)) for label in labels],
+                    dtype=np.int64,
+                )
 
                 first_rel = int(h5["img_to_first_rel"][h5_index])
                 last_rel = int(h5["img_to_last_rel"][h5_index])
                 if first_rel >= 0 and last_rel >= first_rel:
                     rel_obj_idx = all_relationships[first_rel : last_rel + 1] - first_box
                     predicates = all_predicates[first_rel : last_rel + 1]
+                    predicates = np.asarray(
+                        [self.predicate_idx_aliases.get(int(pred), int(pred)) for pred in predicates],
+                        dtype=np.int64,
+                    )
                     edges = np.column_stack((rel_obj_idx, predicates)).astype(np.int64)
                 else:
                     edges = np.zeros((0, 3), dtype=np.int64)
@@ -220,13 +274,14 @@ class StanfordFilteredVGDataset:
                     {
                         "boxes": torch.as_tensor(boxes, dtype=torch.float32),
                         "labels": torch.as_tensor(labels, dtype=torch.int64),
+                        "relation_labels": torch.as_tensor(relation_labels, dtype=torch.int64),
                         "edges": torch.as_tensor(edges, dtype=torch.int64),
                     }
                 )
 
     def get_groundtruth(self, index):
         ann = self.annotations[index]
-        return ann["boxes"], ann["labels"], ann["edges"]
+        return ann["boxes"], ann.get("relation_labels", ann["labels"]), ann["edges"]
 
     @property
     def coco(self):
@@ -265,7 +320,16 @@ class StanfordFilteredVGDataset:
         return self._coco
 
 
-def build_prediction(record, class_to_idx, pred_to_idx, synonym_map, pred_box_scale, image_info_map, coord_mode):
+def build_prediction(
+    record,
+    class_to_idx,
+    pred_to_idx,
+    synonym_map,
+    pred_box_scale,
+    image_info_map,
+    coord_mode,
+    object_idx_aliases,
+):
     stats = base.Counter()
     image_id = parse_object_image_id(record)
     if image_id is None:
@@ -286,6 +350,7 @@ def build_prediction(record, class_to_idx, pred_to_idx, synonym_map, pred_box_sc
 
     pred_boxes = []
     pred_labels = []
+    pred_relation_labels = []
     id_to_index = {}
     for obj in objects:
         if isinstance(obj, (list, tuple)) and len(obj) == 2:
@@ -317,6 +382,7 @@ def build_prediction(record, class_to_idx, pred_to_idx, synonym_map, pred_box_sc
         id_to_index[obj_id] = len(pred_boxes)
         pred_boxes.append(box)
         pred_labels.append(label)
+        pred_relation_labels.append(object_idx_aliases.get(int(label), int(label)))
 
     relation_rows = []
     for rel_order, rel in enumerate(relationships):
@@ -345,6 +411,7 @@ def build_prediction(record, class_to_idx, pred_to_idx, synonym_map, pred_box_sc
         if pred_name is None:
             stats["unknown_predicate"] += 1
             continue
+        pred_name = canonicalize_predicate_name(pred_name, pred_to_idx)
         relation_rows.append((rel_order, subj_idx, obj_idx, pred_to_idx[pred_name]))
 
     if not pred_boxes:
@@ -361,7 +428,7 @@ def build_prediction(record, class_to_idx, pred_to_idx, synonym_map, pred_box_sc
                 "all_node_pairs": torch.zeros((0, 2), dtype=torch.int64),
                 "all_relation": torch.zeros((0, len(pred_to_idx)), dtype=torch.float32),
                 "pred_boxes": torch.as_tensor(pred_boxes, dtype=torch.float32),
-                "pred_boxes_class": torch.as_tensor(pred_labels, dtype=torch.int64),
+                "pred_boxes_class": torch.as_tensor(pred_relation_labels, dtype=torch.int64),
                 "pred_boxes_score": torch.ones((len(pred_boxes),), dtype=torch.float32),
             },
         }
@@ -381,7 +448,7 @@ def build_prediction(record, class_to_idx, pred_to_idx, synonym_map, pred_box_sc
             "all_node_pairs": torch.as_tensor(all_node_pairs, dtype=torch.int64),
             "all_relation": torch.as_tensor(all_relation, dtype=torch.float32),
             "pred_boxes": torch.as_tensor(pred_boxes, dtype=torch.float32),
-            "pred_boxes_class": torch.as_tensor(pred_labels, dtype=torch.int64),
+            "pred_boxes_class": torch.as_tensor(pred_relation_labels, dtype=torch.int64),
             "pred_boxes_score": torch.ones((len(pred_boxes),), dtype=torch.float32),
         },
     }
@@ -390,7 +457,7 @@ def build_prediction(record, class_to_idx, pred_to_idx, synonym_map, pred_box_sc
     return image_id, base.with_stats(pred, stats)
 
 
-def load_predictions(args, class_to_idx, pred_to_idx, synonym_map):
+def load_predictions(args, class_to_idx, pred_to_idx, synonym_map, object_idx_aliases):
     predictions = OrderedDict()
     stats = base.Counter()
     image_info_map = base.build_image_info_map(args.vg_dir)
@@ -412,6 +479,7 @@ def load_predictions(args, class_to_idx, pred_to_idx, synonym_map):
                 args.pred_box_scale,
                 image_info_map,
                 args.coord_mode,
+                object_idx_aliases,
             )
             if image_id is None:
                 stats.update(pred_or_stats)
@@ -470,13 +538,21 @@ def main():
     pred_to_idx = {base.normalize_text(name): idx for idx, name in enumerate(ind_to_predicates)}
     valid_predicates = set(pred_to_idx.keys()) - {"__background__"}
     synonym_map = {} if args.no_synonyms else base.load_predicate_synonyms(args.r1_root, valid_predicates)
+    object_idx_aliases = build_index_aliases(ind_to_classes, OBJECT_CANONICAL_ALIASES)
+    predicate_idx_aliases = build_index_aliases(ind_to_predicates, PREDICATE_CANONICAL_ALIASES)
 
-    predictions, parse_stats = load_predictions(args, class_to_idx, pred_to_idx, synonym_map)
+    predictions, parse_stats = load_predictions(args, class_to_idx, pred_to_idx, synonym_map, object_idx_aliases)
     if not predictions:
         raise RuntimeError("No valid predictions were parsed.")
 
     split_to_id = {"train": 0, "val": 1, "test": 2}
-    dataset = StanfordFilteredVGDataset(args.vg_dir, predictions.keys(), split_to_id[args.split])
+    dataset = StanfordFilteredVGDataset(
+        args.vg_dir,
+        predictions.keys(),
+        split_to_id[args.split],
+        object_idx_aliases=object_idx_aliases,
+        predicate_idx_aliases=predicate_idx_aliases,
+    )
     predictions = OrderedDict((image_id, predictions.get(image_id)) for image_id in dataset.ids)
     patched_empty = base.patch_empty_graphs_for_zero_recall(predictions, dataset, len(ind_to_predicates))
 
@@ -540,6 +616,8 @@ def main():
         "avg_pred_triplets_per_image": avg_pred_triplets,
         "num_empty_or_missing_predictions_patched_as_zero_recall": patched_empty,
         "parse_stats": dict(parse_stats),
+        "object_canonical_aliases": OBJECT_CANONICAL_ALIASES,
+        "predicate_canonical_aliases": PREDICATE_CANONICAL_ALIASES,
         "metrics": metrics,
     }
 
