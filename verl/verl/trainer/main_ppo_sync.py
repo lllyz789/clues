@@ -120,6 +120,7 @@ VG_OPD_FORMAT_WEIGHT = 1.0
 VG_OPD_NODE_WEIGHT = 1.0
 VG_OPD_BOX_WEIGHT = 1.0
 VG_OPD_EDGE_WEIGHT = 1.0
+VG_OPD_EDGE_SCORE_SCALE = 5.0
 
 
 def _token_span_in_response(tokenizer, response_ids: torch.Tensor, start_text: str, end_text: str) -> torch.Tensor:
@@ -1577,7 +1578,7 @@ class PPOTrainer:
         )
 
         # Compute per-pair weighted edge reward:
-        # For each sample, edge_opd = sum(triplet_score_i * pair_opd_i) / n_gt_rels
+        # For each sample, edge_opd = 5 * sum(triplet_score_i * pair_opd_i) / n_gt_rels
         batch_size = data.batch["responses"].shape[0]
         device = data.batch["rm_scores"].device
         edge_reward_opd = torch.zeros(batch_size, dtype=torch.float32, device=device)
@@ -1594,7 +1595,7 @@ class PPOTrainer:
             for pair_key, triplet_score in edge_per_pair.items():
                 opd = pair_opd.get(pair_key, 0.0)
                 weighted_sum += triplet_score * opd
-            edge_reward_opd[i] = weighted_sum / max(1, n_gt_rels)
+            edge_reward_opd[i] = (weighted_sum / max(1, n_gt_rels)) * VG_OPD_EDGE_SCORE_SCALE
 
             # Mean OPD for logging
             if pair_opd:
