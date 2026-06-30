@@ -2,20 +2,20 @@
 R1-SGG-style reward function for VG scene graph generation, adapted for verl.
 
 Reward components (matching R1-SGG):
-  1. format_reward: checks <think>...</think><answer>...</answer> structure
+  1. format_reward: checks <CATEGORY>...</CATEGORY><OBJECT>...</OBJECT><RELATION>...</RELATION> structure
   2. node_acc_reward: category semantic similarity via bipartite matching
   3. node_box_reward: GIoU + exp(-L1) of matched object boxes
   4. edge_reward: triplet matching after object bipartite assignment
 
-Uses difflib for string similarity (no spaCy dependency).
+Uses the local LFM embedding model for semantic similarity.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 import re
-from difflib import SequenceMatcher
 from functools import lru_cache
 from typing import Any
 
@@ -23,17 +23,25 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
-ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
-STRICT_FORMAT_RE = re.compile(r"\s*<think>.*?</think>\s*<answer>\s*(.*?)\s*</answer>\s*", re.DOTALL)
+RELATION_GROUP_KEYS = (
+    "spatial_relations",
+    "contact_relations",
+    "possession_relations",
+    "action_relations",
+    "motion_relations",
+)
 
 FORMAT_REWARD_WEIGHT = 1.0
 NODE_REWARD_WEIGHT = 2.0
-PAIR_REWARD_WEIGHT = 3.0
 EDGE_REWARD_WEIGHT = 5.0
 
 SEM_WEIGHT = 1.0
 IOU_WEIGHT = 2.0
 BOX_L1_WEIGHT = 5.0
+
+LFM_MODEL_PATH = os.environ.get("VG_RELATION_LFM_MODEL_PATH", "/root/autodl-tmp/lyz/model/LFM")
+LFM_MAX_LENGTH = int(os.environ.get("VG_RELATION_LFM_MAX_LENGTH", "512"))
+LFM_DEVICE = os.environ.get("VG_RELATION_LFM_DEVICE")
 
 
 def _norm_label(value: Any) -> str:
@@ -48,9 +56,7 @@ def _category_from_id(obj_id: str) -> str:
 
 
 def _safe_bbox(value: Any) -> list[float] | None:
-    if hasattr(value, "tolist"):
-        value = value.tolist()
-    if not isinstance(value, (list, tuple)) or len(value) != 4:
+    if not isinstance(value, list) or len(value) != 4:
         return None
     try:
         bbox = [float(x) for x in value]
@@ -62,25 +68,70 @@ def _safe_bbox(value: Any) -> list[float] | None:
 
 
 def _as_list(value: Any) -> list | None:
-    if hasattr(value, "tolist"):
-        value = value.tolist()
-    if isinstance(value, tuple):
-        value = list(value)
     return value if isinstance(value, list) else None
 
 
 def _get_bbox_value(obj: dict) -> Any:
-    if "bbox" in obj and obj["bbox"] is not None:
-        return obj["bbox"]
-    return obj.get("box")
+    return obj.get("bbox")
+
+
+@lru_cache(maxsize=1)
+def _get_lfm_encoder() -> tuple[Any, Any, Any]:
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+
+    device = torch.device(LFM_DEVICE or ("cuda" if torch.cuda.is_available() else "cpu"))
+    torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    tokenizer = AutoTokenizer.from_pretrained(
+        LFM_MODEL_PATH,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    model = AutoModel.from_pretrained(
+        LFM_MODEL_PATH,
+        trust_remote_code=True,
+        local_files_only=True,
+        dtype=torch_dtype,
+    )
+    model.to(device)
+    model.eval()
+    return tokenizer, model, device
+
+
+@lru_cache(maxsize=8192)
+def _lfm_embedding(label: str) -> np.ndarray:
+    import torch
+    import torch.nn.functional as F
+
+    label = _norm_label(label)
+    if not label:
+        return np.empty((0,), dtype=np.float32)
+
+    tokenizer, model, device = _get_lfm_encoder()
+    inputs = tokenizer(
+        label,
+        padding=True,
+        truncation=True,
+        max_length=LFM_MAX_LENGTH,
+        return_tensors="pt",
+    )
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+
+    with torch.inference_mode():
+        outputs = model(**inputs)
+        embedding = outputs.last_hidden_state[:, 0]
+        embedding = F.normalize(embedding.float(), p=2, dim=-1)
+
+    return embedding[0].cpu().numpy().astype(np.float32)
 
 
 @lru_cache(maxsize=8192)
 def semantic_similarity(a: str, b: str) -> float:
-    a, b = _norm_label(a), _norm_label(b)
-    if a == b:
-        return 1.0
-    return SequenceMatcher(None, a, b).ratio()
+    emb_a = _lfm_embedding(a)
+    emb_b = _lfm_embedding(b)
+    if emb_a.size == 0 or emb_b.size == 0:
+        return 0.0
+    return float(np.clip(np.dot(emb_a, emb_b), 0.0, 1.0))
 
 
 def compute_iou(box_a: list, box_b: list) -> float:
@@ -147,147 +198,158 @@ def bi_match(gt_objs: list[dict], pred_objs: list[dict]) -> list[dict]:
     ]
 
 
-def _extract_answer(text: str) -> str:
-    text = text.replace("```", " ").replace("json", " ").strip()
-    match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    match = re.search(r"<answer>(.*)", text, re.DOTALL)
-    return match.group(1).strip() if match else text
+def _loads_tag_json(payload: str) -> Any:
+    payload = (payload or "").strip()
+    if not payload:
+        return None
+    try:
+        return json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _extract_tag_json(text: str, tag: str) -> Any:
+    match = re.search(rf"<{tag}>\s*(.*?)\s*</{tag}>", text or "", flags=re.DOTALL | re.IGNORECASE)
+    if not match:
+        return None
+    return _loads_tag_json(match.group(1))
+
+
+def _flatten_structured_relations(rel_payload: Any) -> list:
+    if rel_payload is None:
+        return []
+    if not isinstance(rel_payload, dict):
+        return []
+
+    if "relations" in rel_payload:
+        inner = rel_payload.get("relations")
+        if isinstance(inner, dict):
+            return _flatten_structured_relations(inner)
+        return []
+
+    flattened = []
+    for key in RELATION_GROUP_KEYS:
+        items = rel_payload.get(key, [])
+        if isinstance(items, list):
+            flattened.extend(items)
+    return flattened
+
+
+def _extract_structured_graph_data(text: str) -> dict | None:
+    """Parse structured <OBJECT>/<RELATION> tags into the internal graph schema."""
+    category_payload = _extract_tag_json(text, "CATEGORY")
+    object_payload = _extract_tag_json(text, "OBJECT")
+    relation_payload = _extract_tag_json(text, "RELATION")
+    if category_payload is None or not isinstance(object_payload, dict) or relation_payload is None:
+        return None
+    return {
+        "objects": object_payload.get("objects", []),
+        "relations": _flatten_structured_relations(relation_payload),
+    }
 
 
 def _parse_pred_graph(text: str) -> dict | None:
     """Parse model output into normalized graph with id/bbox dicts."""
-    try:
-        data = json.loads(_extract_answer(text))
-    except (json.JSONDecodeError, TypeError):
+    data = _extract_structured_graph_data(text)
+    if data is None:
         return None
     if not isinstance(data, dict):
         return None
-    if "objects" not in data or "relationships" not in data:
+    if "objects" not in data or "relations" not in data:
         return None
     raw_objects = _as_list(data["objects"])
-    raw_relationships = _as_list(data["relationships"])
-    if raw_objects is None or raw_relationships is None:
+    raw_relations = _as_list(data["relations"])
+    if raw_objects is None or raw_relations is None:
         return None
 
     objects = []
     for obj in raw_objects:
-        if isinstance(obj, dict) and "id" in obj and ("bbox" in obj or "box" in obj):
-            bbox = _safe_bbox(_get_bbox_value(obj))
-            if bbox is None:
-                return None
-            objects.append({"id": _norm_label(obj["id"]), "bbox": bbox})
-        elif isinstance(obj, (list, tuple)) and len(obj) == 2:
-            obj_id, bbox = obj
-            bbox = _safe_bbox(bbox)
-            if bbox is None:
-                return None
-            objects.append({"id": _norm_label(obj_id), "bbox": bbox})
-        else:
+        if not isinstance(obj, dict) or "id" not in obj or "bbox" not in obj:
             return None
+        bbox = _safe_bbox(_get_bbox_value(obj))
+        if bbox is None:
+            return None
+        objects.append({"id": _norm_label(obj["id"]), "bbox": bbox})
 
-    relationships = []
-    for rel in raw_relationships:
-        if isinstance(rel, dict) and all(k in rel for k in ("subject", "predicate", "object")):
-            relationships.append({
-                "subject": _norm_label(rel["subject"]),
-                "predicate": _norm_label(rel["predicate"]),
-                "object": _norm_label(rel["object"]),
-            })
-        elif isinstance(rel, (list, tuple)) and len(rel) == 3:
-            relationships.append({
-                "subject": _norm_label(rel[0]),
-                "predicate": _norm_label(rel[1]),
-                "object": _norm_label(rel[2]),
-            })
-        else:
+    relations = []
+    for rel in raw_relations:
+        if not isinstance(rel, dict) or not all(k in rel for k in ("subject", "predicate", "object")):
             return None
+        relations.append({
+            "subject": _norm_label(rel["subject"]),
+            "predicate": _norm_label(rel["predicate"]),
+            "object": _norm_label(rel["object"]),
+        })
 
     if not objects:
         return None
-    return {"objects": objects, "relationships": relationships}
+    return {"objects": objects, "relations": relations}
 
 
 def _parse_gt_graph(ground_truth: Any) -> dict | None:
     """Parse ground truth into normalized graph with id/bbox dicts."""
     if isinstance(ground_truth, str):
-        try:
-            ground_truth = json.loads(ground_truth)
-        except json.JSONDecodeError:
+        structured = _extract_structured_graph_data(ground_truth)
+        if structured is None:
             return None
+        ground_truth = structured
     if not isinstance(ground_truth, dict):
         return None
-    if "objects" not in ground_truth or "relationships" not in ground_truth:
+    if "objects" not in ground_truth or "relations" not in ground_truth:
         return None
     raw_objects = _as_list(ground_truth["objects"])
-    raw_relationships = _as_list(ground_truth["relationships"])
-    if raw_objects is None or raw_relationships is None:
+    raw_relations = _as_list(ground_truth["relations"])
+    if raw_objects is None or raw_relations is None:
         return None
 
     objects = []
     for obj in raw_objects:
-        if isinstance(obj, dict):
-            obj_id = obj.get("id", "")
-            bbox = _safe_bbox(_get_bbox_value(obj))
-            if bbox is not None:
-                objects.append({"id": _norm_label(obj_id), "bbox": bbox})
-        elif isinstance(obj, (list, tuple)) and len(obj) == 2:
-            obj_id, bbox = obj
-            bbox = _safe_bbox(bbox)
-            if bbox is not None:
-                objects.append({"id": _norm_label(obj_id), "bbox": bbox})
+        if not isinstance(obj, dict) or "id" not in obj or "bbox" not in obj:
+            return None
+        bbox = _safe_bbox(_get_bbox_value(obj))
+        if bbox is None:
+            return None
+        objects.append({"id": _norm_label(obj["id"]), "bbox": bbox})
 
-    relationships = []
-    for rel in raw_relationships:
-        if isinstance(rel, dict) and all(k in rel for k in ("subject", "predicate", "object")):
-            relationships.append({
-                "subject": _norm_label(rel["subject"]),
-                "predicate": _norm_label(rel["predicate"]),
-                "object": _norm_label(rel["object"]),
-            })
-        elif isinstance(rel, (list, tuple)) and len(rel) == 3:
-            relationships.append({
-                "subject": _norm_label(rel[0]),
-                "predicate": _norm_label(rel[1]),
-                "object": _norm_label(rel[2]),
-            })
+    relations = []
+    for rel in raw_relations:
+        if not isinstance(rel, dict) or not all(k in rel for k in ("subject", "predicate", "object")):
+            return None
+        relations.append({
+            "subject": _norm_label(rel["subject"]),
+            "predicate": _norm_label(rel["predicate"]),
+            "object": _norm_label(rel["object"]),
+        })
 
     if not objects:
         return None
-    return {"objects": objects, "relationships": relationships}
+    return {"objects": objects, "relations": relations}
 
 
 def _format_reward(text: str) -> float:
     text = text.strip()
-    has_think_open = "<think>" in text
-    has_think_close = "</think>" in text
-    has_answer_open = "<answer>" in text
-    has_answer_close = "</answer>" in text
+    category_payload = _extract_tag_json(text, "CATEGORY")
+    object_payload = _extract_tag_json(text, "OBJECT")
+    relation_payload = _extract_tag_json(text, "RELATION")
+    if category_payload is None and object_payload is None and relation_payload is None:
+        return 0.0
+    if not isinstance(category_payload, dict) or "categories" not in category_payload:
+        return 0.5
+    if not isinstance(object_payload, dict) or "objects" not in object_payload:
+        return 0.5
+    if not isinstance(relation_payload, dict):
+        return 0.5
+    if not isinstance(relation_payload.get("relations"), dict):
+        return 0.5
 
-    if has_think_close and has_answer_close:
-        match = re.search(r"<answer>\s*(.*?)\s*</answer>", text, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group(1).strip())
-            except (json.JSONDecodeError, TypeError):
-                return 0.1
-            if isinstance(data, dict) and "objects" in data and "relationships" in data:
-                strict = re.fullmatch(
-                    re.compile(r"\s*<think>.*?</think>\s*<answer>.*?</answer>\s*", re.DOTALL),
-                    text,
-                )
-                return 1.0 if strict else 0.8
-            return 0.1
-        return 0.1
-
-    if has_think_open and has_think_close and has_answer_open and not has_answer_close:
-        return 0.2
-
-    if has_think_open and not has_think_close:
-        return 0.05
-
-    return 0.0
+    strict = re.fullmatch(
+        re.compile(
+            r"\s*<CATEGORY>.*?</CATEGORY>\s*<OBJECT>.*?</OBJECT>\s*<RELATION>.*?</RELATION>\s*",
+            re.DOTALL | re.IGNORECASE,
+        ),
+        text,
+    )
+    return 1.0 if strict else 0.5
 
 
 def _node_acc_reward(gt_graph: dict, pred_graph: dict) -> float:
@@ -326,9 +388,9 @@ def _node_box_reward(gt_graph: dict, pred_graph: dict) -> float:
 
 def _edge_reward(gt_graph: dict, pred_graph: dict) -> float:
     gt_objs = gt_graph["objects"]
-    gt_rels = gt_graph["relationships"]
+    gt_rels = gt_graph["relations"]
     pred_objs = pred_graph["objects"]
-    pred_rels = pred_graph["relationships"]
+    pred_rels = pred_graph["relations"]
     if not gt_rels:
         return 0.0
 
@@ -366,46 +428,6 @@ def _edge_reward(gt_graph: dict, pred_graph: dict) -> float:
     return reward / max(1, len(gt_rels))
 
 
-def _pair_reward(gt_graph: dict, pred_graph: dict) -> float:
-    gt_objs = gt_graph["objects"]
-    gt_rels = gt_graph["relationships"]
-    pred_objs = pred_graph["objects"]
-    pred_rels = pred_graph["relationships"]
-    if not gt_rels or not pred_rels:
-        return 0.0
-
-    assignments = bi_match(gt_objs, pred_objs)
-    map_obj = {}
-    for assign in assignments:
-        gt_id = assign["groundtruth"]["id"]
-        pred_id = assign["prediction"]["id"]
-        map_obj[gt_id] = pred_id
-
-    pred_pairs = {
-        (rel["subject"], rel["object"])
-        for rel in pred_rels
-    }
-
-    matched = 0.0
-    for gt_rel in gt_rels:
-        sub, obj = gt_rel["subject"], gt_rel["object"]
-        if sub not in map_obj or obj not in map_obj:
-            continue
-        sub_mapped = map_obj[sub]
-        obj_mapped = map_obj[obj]
-        if (sub_mapped, obj_mapped) in pred_pairs:
-            matched += (
-                semantic_similarity(_category_from_id(sub), _category_from_id(sub_mapped))
-                * semantic_similarity(_category_from_id(obj), _category_from_id(obj_mapped))
-            )
-
-    precision = matched / len(pred_rels)
-    recall = matched / len(gt_rels)
-    if precision + recall == 0:
-        return 0.0
-    return 2.0 * precision * recall / (precision + recall)
-
-
 def compute_score(
     data_source: str | None = None,
     solution_str: str | None = None,
@@ -422,7 +444,6 @@ def compute_score(
         "format_reward": 0.0,
         "node_acc_reward": 0.0,
         "node_box_reward": 0.0,
-        "pair_reward": 0.0,
         "edge_reward": 0.0,
     }
 
@@ -434,7 +455,9 @@ def compute_score(
 
         partial = dict(zero)
         partial["format_reward"] = fmt * FORMAT_REWARD_WEIGHT
-        partial["score"] = fmt * FORMAT_REWARD_WEIGHT / (FORMAT_REWARD_WEIGHT + NODE_REWARD_WEIGHT * 2 + PAIR_REWARD_WEIGHT + EDGE_REWARD_WEIGHT)
+        partial["score"] = fmt * FORMAT_REWARD_WEIGHT / (
+            FORMAT_REWARD_WEIGHT + NODE_REWARD_WEIGHT * 2 + EDGE_REWARD_WEIGHT
+        )
 
         # Parse ground truth
         gt_source = ground_truth
@@ -458,7 +481,6 @@ def compute_score(
         # Compute component rewards
         node_acc = _node_acc_reward(gt_graph, pred_graph)
         node_box = _node_box_reward(gt_graph, pred_graph)
-        pair = _pair_reward(gt_graph, pred_graph)
         edge = _edge_reward(gt_graph, pred_graph)
 
         # Weighted combination
@@ -466,16 +488,14 @@ def compute_score(
             fmt * FORMAT_REWARD_WEIGHT
             + node_acc * NODE_REWARD_WEIGHT
             + node_box * NODE_REWARD_WEIGHT
-            + pair * PAIR_REWARD_WEIGHT
             + edge * EDGE_REWARD_WEIGHT
-        ) / (FORMAT_REWARD_WEIGHT + NODE_REWARD_WEIGHT * 2 + PAIR_REWARD_WEIGHT + EDGE_REWARD_WEIGHT)
+        ) / (FORMAT_REWARD_WEIGHT + NODE_REWARD_WEIGHT * 2 + EDGE_REWARD_WEIGHT)
 
         return {
             "score": score,
             "format_reward": fmt * FORMAT_REWARD_WEIGHT,
             "node_acc_reward": node_acc * NODE_REWARD_WEIGHT,
             "node_box_reward": node_box * NODE_REWARD_WEIGHT,
-            "pair_reward": pair * PAIR_REWARD_WEIGHT,
             "edge_reward": edge * EDGE_REWARD_WEIGHT,
         }
     except Exception:

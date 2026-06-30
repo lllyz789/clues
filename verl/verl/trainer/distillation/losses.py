@@ -134,15 +134,23 @@ def compute_topk_loss(
     - student_mass: (bsz, seqlen/cp_size)
     - teacher_mass: (bsz, seqlen/cp_size)
     """
+    loss_mode = distillation_config.distillation_loss.loss_mode
+    use_renorm = loss_mode == "forward_kl_topk_renorm"
+
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
         case "fsdp" | "veomni":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            if use_renorm:
+                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk_renorm
+            else:
+                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
+            if use_renorm:
+                raise NotImplementedError("forward_kl_topk_renorm is not yet supported for megatron strategy.")
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
@@ -245,10 +253,12 @@ def distillation_loss(
         data=data,
     )
     response_mask = data["response_mask"]
+    # Use distillation_mask if present (e.g., to restrict distillation to specific spans)
+    distill_mask = data.get("distillation_mask", response_mask)
     loss_agg_mode = config.loss_agg_mode
 
     distillation_metrics.update(
-        compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=response_mask)
+        compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=distill_mask)
     )
     if loss_config.loss_max_clamp is not None:
         # clamping min is for k1 loss which can be negative
@@ -263,14 +273,14 @@ def distillation_loss(
         old_log_prob = data["old_log_probs"]
         if old_log_prob.is_nested:
             old_log_prob = data["old_log_probs"].to_padded_tensor(0.0)
-        if response_mask.is_nested:
-            response_mask = response_mask.to_padded_tensor(False)
+        if distill_mask.is_nested:
+            distill_mask = distill_mask.to_padded_tensor(False)
         rollout_is_weights = data.get("rollout_is_weights", None)
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
             advantages=-distillation_losses.detach(),
-            response_mask=response_mask,
+            response_mask=distill_mask,
             loss_agg_mode=loss_agg_mode,
             config=loss_config,
             rollout_is_weights=rollout_is_weights,
@@ -279,11 +289,11 @@ def distillation_loss(
         distillation_metrics.update(pg_metrics)
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
-        if response_mask.is_nested:
-            response_mask = response_mask.to_padded_tensor(False)
+        if distill_mask.is_nested:
+            distill_mask = distill_mask.to_padded_tensor(False)
         distillation_loss = agg_loss(
             loss_mat=distillation_losses,
-            loss_mask=response_mask,
+            loss_mask=distill_mask,
             loss_agg_mode=loss_agg_mode,
             **config.global_batch_info,
         )
@@ -351,6 +361,48 @@ def compute_forward_kl_topk(
     }
 
     # Due to use of top-k, student and teacher distributions don't sum to 1 -> divergences can be negative.
+    distillation_losses = distillation_losses.clamp_min(0.0)
+
+    return distillation_losses, distillation_metrics
+
+
+@register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk_renorm"], use_topk=True))  # type: ignore[arg-type]
+def compute_forward_kl_topk_renorm(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute forward KL distillation loss with renormalization over local support set.
+
+    The support set = teacher top-K + student sampled token (if not in top-K).
+    Both distributions are renormalized before computing forward KL.
+
+    Returns:
+    - distillation_losses: (bsz, resp_len)
+    - distillation_metrics: Dictionary of metrics.
+    """
+    distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)
+    student_mass = no_padding_2_padding(model_output["student_mass"], data)
+    teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
+    if data["response_mask"].is_nested:
+        response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
+    else:
+        response_mask_bool = data["response_mask"].bool()
+    assert distillation_losses.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
+
+    student_mass_valid = student_mass[response_mask_bool]
+    teacher_mass_valid = teacher_mass[response_mask_bool]
+    distillation_metrics = {
+        "distillation/student_mass": student_mass_valid.mean().item(),
+        "distillation/student_mass_min": Metric(AggregationType.MIN, student_mass_valid.min()),
+        "distillation/student_mass_max": Metric(AggregationType.MAX, student_mass_valid.max()),
+        "distillation/teacher_mass": teacher_mass_valid.mean().item(),
+        "distillation/teacher_mass_min": Metric(AggregationType.MIN, teacher_mass_valid.min()),
+        "distillation/teacher_mass_max": Metric(AggregationType.MAX, teacher_mass_valid.max()),
+    }
+
+    # After renormalization, KL is always >= 0, but clamp for numerical safety.
     distillation_losses = distillation_losses.clamp_min(0.0)
 
     return distillation_losses, distillation_metrics

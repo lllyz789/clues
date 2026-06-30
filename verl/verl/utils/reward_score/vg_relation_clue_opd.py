@@ -1,11 +1,12 @@
 """
-R1-SGG-style reward function for VG scene graph generation, adapted for verl.
+R1-SGG-style reward function for VG scene graph generation with clue-aware OPD reward.
 
 Reward components (matching R1-SGG):
-  1. format_reward: checks <CATEGORY>...</CATEGORY><OBJECT>...</OBJECT><RELATION>...</RELATION> structure
+  1. format_reward: checks <CATEGORY>...</CATEGORY><OBJECT>...</OBJECT><CLUE>...</CLUE><RELATION>...</RELATION> structure
   2. node_acc_reward: category semantic similarity via bipartite matching
   3. node_box_reward: GIoU + exp(-L1) of matched object boxes
   4. edge_reward: triplet matching after object bipartite assignment
+  5. clue_reward: filled later from OPD teacher logprobs in the trainer
 
 Uses the local all-MiniLM-L6-v2 embedding model for semantic similarity.
 """
@@ -42,8 +43,6 @@ BOX_L1_WEIGHT = 5.0
 EMBED_MODEL_PATH = os.environ.get("VG_RELATION_EMBED_MODEL_PATH", "/root/autodl-tmp/lyz/model/all-MiniLM-L6-v2")
 EMBED_MAX_LENGTH = int(os.environ.get("VG_RELATION_EMBED_MAX_LENGTH", "512"))
 EMBED_DEVICE = os.environ.get("VG_RELATION_EMBED_DEVICE")
-
-
 def _norm_label(value: Any) -> str:
     s = str(value).strip().lower()
     s = s.replace("_", " ").replace("-", " ")
@@ -56,7 +55,9 @@ def _category_from_id(obj_id: str) -> str:
 
 
 def _safe_bbox(value: Any) -> list[float] | None:
-    if not isinstance(value, list) or len(value) != 4:
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
         return None
     try:
         bbox = [float(x) for x in value]
@@ -68,11 +69,21 @@ def _safe_bbox(value: Any) -> list[float] | None:
 
 
 def _as_list(value: Any) -> list | None:
-    return value if isinstance(value, list) else None
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return None
 
 
 def _get_bbox_value(obj: dict) -> Any:
-    return obj.get("bbox")
+    return obj.get("bbox", obj.get("box"))
+
+
+def _to_unit_box(box: list[float]) -> list[float]:
+    return [float(x) / 1000.0 for x in box]
 
 
 @lru_cache(maxsize=1)
@@ -218,13 +229,22 @@ def _extract_tag_json(text: str, tag: str) -> Any:
 def _flatten_structured_relations(rel_payload: Any) -> list:
     if rel_payload is None:
         return []
+    if isinstance(rel_payload, np.ndarray):
+        rel_payload = rel_payload.tolist()
+    if isinstance(rel_payload, list):
+        return rel_payload
     if not isinstance(rel_payload, dict):
         return []
+
+    if "relationships" in rel_payload:
+        return _flatten_structured_relations(rel_payload.get("relationships"))
 
     if "relations" in rel_payload:
         inner = rel_payload.get("relations")
         if isinstance(inner, dict):
             return _flatten_structured_relations(inner)
+        if isinstance(inner, list):
+            return inner
         return []
 
     flattened = []
@@ -246,6 +266,36 @@ def _extract_structured_graph_data(text: str) -> dict | None:
         "objects": object_payload.get("objects", []),
         "relations": _flatten_structured_relations(relation_payload),
     }
+
+
+def _extract_clue_text(text: str) -> str:
+    match = re.search(r"<\s*clue\s*>(.*?)<\s*/\s*clue\s*>", text or "", flags=re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def _parse_clue_lines(text: str) -> dict[tuple[str, str], dict[str, str]]:
+    line_re = re.compile(
+        r"^\s*\(\s*(?P<subject>[^,]+?)\s*,\s*(?P<object>[^)]+?)\s*\)\s*:\s*"
+        r"(?P<evidence>.*?)\s+Type\s*:\s*(?P<relation_type>.*?)\s*"
+        r"\.\s*Final\s+Predicate\s*:\s*(?P<predicate>.*?)\s*$",
+        re.IGNORECASE,
+    )
+    parsed: dict[tuple[str, str], dict[str, str]] = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = line_re.match(line)
+        if not match:
+            continue
+        parsed[(_norm_label(match.group("subject")), _norm_label(match.group("object")))] = {
+            "subject": _norm_label(match.group("subject")),
+            "object": _norm_label(match.group("object")),
+            "evidence": match.group("evidence").strip(),
+            "relation_type": _norm_label(match.group("relation_type")),
+            "predicate": _norm_label(match.group("predicate")),
+        }
+    return parsed
 
 
 def _parse_pred_graph(text: str) -> dict | None:
@@ -295,21 +345,37 @@ def _parse_gt_graph(ground_truth: Any) -> dict | None:
         ground_truth = structured
     if not isinstance(ground_truth, dict):
         return None
-    if "objects" not in ground_truth or "relations" not in ground_truth:
+    if "answer" in ground_truth:
+        return _parse_gt_graph(ground_truth.get("answer"))
+    if "ground_truth" in ground_truth:
+        return _parse_gt_graph(ground_truth.get("ground_truth"))
+    if "ground_truth_graph" in ground_truth:
+        return _parse_gt_graph(ground_truth.get("ground_truth_graph"))
+
+    if "objects" not in ground_truth:
         return None
     raw_objects = _as_list(ground_truth["objects"])
-    raw_relations = _as_list(ground_truth["relations"])
+    raw_relations = _flatten_structured_relations(
+        ground_truth.get("relations", ground_truth.get("relationships"))
+    )
     if raw_objects is None or raw_relations is None:
         return None
 
     objects = []
     for obj in raw_objects:
-        if not isinstance(obj, dict) or "id" not in obj or "bbox" not in obj:
+        if isinstance(obj, dict):
+            if "id" not in obj:
+                return None
+            bbox = _safe_bbox(_get_bbox_value(obj))
+            obj_id = obj["id"]
+        elif isinstance(obj, list) and len(obj) >= 2:
+            obj_id = obj[0]
+            bbox = _safe_bbox(obj[1])
+        else:
             return None
-        bbox = _safe_bbox(_get_bbox_value(obj))
         if bbox is None:
             return None
-        objects.append({"id": _norm_label(obj["id"]), "bbox": bbox})
+        objects.append({"id": _norm_label(obj_id), "bbox": bbox})
 
     relations = []
     for rel in raw_relations:
@@ -323,7 +389,14 @@ def _parse_gt_graph(ground_truth: Any) -> dict | None:
 
     if not objects:
         return None
-    return {"objects": objects, "relations": relations}
+    clue_map = {}
+    if isinstance(ground_truth, dict):
+        raw_clue = ground_truth.get("clues") or ground_truth.get("clue_text") or ground_truth.get("clue")
+        if isinstance(raw_clue, list):
+            raw_clue = "\n".join(str(x) for x in raw_clue)
+        if isinstance(raw_clue, str) and raw_clue.strip():
+            clue_map = _parse_clue_lines(raw_clue)
+    return {"objects": objects, "relations": relations, "clues": clue_map}
 
 
 def _format_reward(text: str) -> float:
@@ -337,18 +410,18 @@ def _format_reward(text: str) -> float:
         return 0.5
     if not isinstance(object_payload, dict) or "objects" not in object_payload:
         return 0.5
+    clue_payload = _extract_clue_text(text)
+    if not clue_payload:
+        return 0.5
     if not isinstance(relation_payload, dict):
         return 0.5
     if not isinstance(relation_payload.get("relations"), dict):
         return 0.5
+    if not _parse_clue_lines(clue_payload):
+        return 0.5
 
-    strict = re.fullmatch(
-        re.compile(
-            r"\s*<CATEGORY>.*?</CATEGORY>\s*<OBJECT>.*?</OBJECT>\s*<RELATION>.*?</RELATION>\s*",
-            re.DOTALL | re.IGNORECASE,
-        ),
-        text,
-    )
+    pattern = r"\s*<CATEGORY>.*?</CATEGORY>\s*<OBJECT>.*?</OBJECT>\s*<CLUE>.*?</CLUE>\s*<RELATION>.*?</RELATION>\s*"
+    strict = re.fullmatch(re.compile(pattern, re.DOTALL | re.IGNORECASE), text)
     return 1.0 if strict else 0.5
 
 
@@ -387,12 +460,26 @@ def _node_box_reward(gt_graph: dict, pred_graph: dict) -> float:
 
 
 def _edge_reward(gt_graph: dict, pred_graph: dict) -> float:
+    """Compute scalar edge reward (average triplet score over GT relations)."""
+    per_pair = _edge_reward_per_pair(gt_graph, pred_graph)
+    if not per_pair:
+        return 0.0
+    return sum(per_pair.values()) / max(1, len(gt_graph["relations"]))
+
+
+def _edge_reward_per_pair(gt_graph: dict, pred_graph: dict) -> dict[str, float]:
+    """Compute per-pair edge scores keyed by predicted "subject_id|object_id".
+
+    Returns a dict mapping "pred_sub_id|pred_obj_id" -> best triplet score for that pair.
+    Multiple GT triplets mapping to the same pred pair accumulate via max.
+    Uses "|" separator in string key for JSON serialization compatibility.
+    """
     gt_objs = gt_graph["objects"]
     gt_rels = gt_graph["relations"]
     pred_objs = pred_graph["objects"]
     pred_rels = pred_graph["relations"]
     if not gt_rels:
-        return 0.0
+        return {}
 
     assignments = bi_match(gt_objs, pred_objs)
     map_obj = {}
@@ -406,7 +493,7 @@ def _edge_reward(gt_graph: dict, pred_graph: dict) -> float:
         key = (rel["subject"], rel["object"])
         pred_pair_to_predicates.setdefault(key, []).append(rel["predicate"])
 
-    reward = 0.0
+    pair_scores: dict[str, float] = {}
     for gt_rel in gt_rels:
         sub, obj = gt_rel["subject"], gt_rel["object"]
         if sub not in map_obj or obj not in map_obj:
@@ -419,13 +506,15 @@ def _edge_reward(gt_graph: dict, pred_graph: dict) -> float:
                 semantic_similarity(gt_rel["predicate"], pred_pred)
                 for pred_pred in pred_predicates
             )
-            reward += (
+            triplet_score = (
                 semantic_similarity(_category_from_id(sub), _category_from_id(sub_mapped))
                 * semantic_similarity(_category_from_id(obj), _category_from_id(obj_mapped))
                 * best_predicate_score
             )
+            key = f"{sub_mapped.lower()}|{obj_mapped.lower()}"
+            pair_scores[key] = max(pair_scores.get(key, 0.0), triplet_score)
 
-    return reward / max(1, len(gt_rels))
+    return pair_scores
 
 
 def compute_score(
@@ -445,6 +534,7 @@ def compute_score(
         "node_acc_reward": 0.0,
         "node_box_reward": 0.0,
         "edge_reward": 0.0,
+        "clue_reward": 0.0,
     }
 
     try:
@@ -474,16 +564,20 @@ def compute_score(
 
         # Normalize boxes to [0, 1] range (both gt and pred are in 0-1000 scale)
         for obj in gt_graph["objects"]:
-            obj["bbox"] = [x / 1000.0 for x in obj["bbox"]]
+            obj["bbox"] = _to_unit_box(obj["bbox"])
         for obj in pred_graph["objects"]:
-            obj["bbox"] = [x / 1000.0 for x in obj["bbox"]]
+            obj["bbox"] = _to_unit_box(obj["bbox"])
 
         # Compute component rewards
         node_acc = _node_acc_reward(gt_graph, pred_graph)
         node_box = _node_box_reward(gt_graph, pred_graph)
         edge = _edge_reward(gt_graph, pred_graph)
+        edge_per_pair = _edge_reward_per_pair(gt_graph, pred_graph)
+        n_gt_rels = max(1, len(gt_graph["relations"]))
 
-        # Weighted combination
+        # This rule reward only scores GT-observable parts. During training,
+        # main_ppo_sync.py replaces this structural score with
+        # edge_reward * OPD-derived clue_score after teacher logprobs are ready.
         score = (
             fmt * FORMAT_REWARD_WEIGHT
             + node_acc * NODE_REWARD_WEIGHT
@@ -497,6 +591,9 @@ def compute_score(
             "node_acc_reward": node_acc * NODE_REWARD_WEIGHT,
             "node_box_reward": node_box * NODE_REWARD_WEIGHT,
             "edge_reward": edge * EDGE_REWARD_WEIGHT,
+            "edge_per_pair": edge_per_pair,
+            "n_gt_rels": n_gt_rels,
+            "clue_reward": 0.0,
         }
     except Exception:
         return zero

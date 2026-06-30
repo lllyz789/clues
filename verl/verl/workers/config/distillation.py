@@ -105,6 +105,13 @@ class DistillationLossConfig(BaseConfig):
                 "should move) is largely unused."
             )
 
+        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk_renorm":
+            print(
+                "WARNING: forward_kl_topk_renorm is most effective as a supervised distillation loss "
+                "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
+                " token's logprob ∇logπ(a), so the renormalized distributional signal is largely unused."
+            )
+
         if not self.use_policy_gradient and self.loss_mode == "k1":
             raise ValueError(
                 "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"

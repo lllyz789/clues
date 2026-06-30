@@ -79,6 +79,7 @@ def _extract_prompt_logprobs_sglang(
         input_top_logprobs = meta_info.get("input_top_logprobs") or []
     prompt_ids_ls: list[list[int]] = []
     prompt_logprobs_ls: list[list[float]] = []
+    width = max(num_prompt_logprobs, 1) + (1 if num_prompt_logprobs > 0 else 0)
     # Entry 0 has logprob=None (no predicting context); skip it, matching vLLM.
     for position in range(1, len(input_token_logprobs)):
         if num_prompt_logprobs == 0:
@@ -86,6 +87,7 @@ def _extract_prompt_logprobs_sglang(
             prompt_ids_ls.append([int(token_id)])
             prompt_logprobs_ls.append([float(logprob)])
         else:
+            sampled_logprob, sampled_token_id, _ = input_token_logprobs[position]
             top_entries = input_top_logprobs[position]
             # SGLang returns ranked best-first; we preserve that ordering so rank
             # 0 is the top-1 token, matching the vLLM extractor's rank-1 slot.
@@ -94,10 +96,17 @@ def _extract_prompt_logprobs_sglang(
             assert len(ids) == num_prompt_logprobs, (
                 f"SGLang returned {len(ids)} top logprobs at position {position}, expected {num_prompt_logprobs}."
             )
+            if sampled_token_id not in ids:
+                ids.append(int(sampled_token_id))
+                logprobs.append(float(sampled_logprob))
+            else:
+                ids.append(int(sampled_token_id))
+                logprobs.append(float(sampled_logprob))
+            assert len(ids) == width and len(logprobs) == width
             prompt_ids_ls.append(ids)
             prompt_logprobs_ls.append(logprobs)
     # Trailing dummy row so total length == len(sequence_ids), matching vLLM.
-    pad_width = max(num_prompt_logprobs, 1)
+    pad_width = width
     prompt_ids_ls.append([0] * pad_width)
     prompt_logprobs_ls.append([0.0] * pad_width)
     assert len(prompt_ids_ls) == sequence_length, (

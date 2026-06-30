@@ -92,3 +92,86 @@ def compute_forward_kl_topk(
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
     }
+
+
+def compute_forward_kl_topk_renorm(
+    student_logits: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    config: DistillationConfig,
+    data_format: str,
+) -> dict[str, torch.Tensor]:
+    """Compute forward KL distillation loss with renormalization over local support set.
+
+    The local support set = teacher top-K tokens + student sampled token (if not
+    already in top-K). Both teacher and student distributions are renormalized over
+    this support set before computing forward KL divergence.
+
+    Args:
+        student_logits: (bsz, seqlen/sp_size, vocab_size).
+        teacher_topk_log_probs: (bsz, seqlen, K+1) — last slot stores sampled token
+            logprob if it is not in teacher top-K, otherwise 0.0.
+        teacher_topk_ids: (bsz, seqlen, K+1) — last slot stores sampled token id
+            if it is not in teacher top-K, otherwise 0.
+        data_format: "thd" or "bshd".
+
+    Returns:
+        dict with distillation_losses, student_mass, teacher_mass (each: bsz, seqlen/sp_size).
+    """
+    assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
+    teacher_topk_log_probs = teacher_topk_log_probs.values().unsqueeze(0)  # (1, total_nnz, K+1)
+    teacher_topk_ids = teacher_topk_ids.values().unsqueeze(0)  # (1, total_nnz, K+1)
+
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        teacher_topk_log_probs = slice_input_tensor(teacher_topk_log_probs, dim=1)
+        teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1)
+    assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
+
+    # Determine which positions have a valid extra sampled token in the last slot.
+    # When sampled token is already in top-K, last slot is left as (id=0, logprob=0.0).
+    has_extra = (teacher_topk_log_probs[..., -1] != 0.0)  # (bsz, seqlen)
+
+    # Build validity mask: (bsz, seqlen, K+1)
+    valid_mask = torch.ones_like(teacher_topk_ids, dtype=torch.bool)
+    valid_mask[..., -1] = has_extra
+
+    # Gather student logits at the support set positions
+    student_logits_at_support = torch.gather(
+        student_logits, dim=-1, index=teacher_topk_ids.long()
+    )  # (bsz, seqlen, K+1)
+
+    # Renormalize student: log_softmax over valid support positions only
+    student_logits_masked = student_logits_at_support.float()
+    student_logits_masked[~valid_mask] = -1e9
+    student_log_probs_renorm = F.log_softmax(student_logits_masked, dim=-1)
+
+    # Renormalize teacher: treat teacher log_probs as unnormalized scores in the
+    # reduced support set, apply log_softmax to renormalize.
+    teacher_logprobs_masked = teacher_topk_log_probs.float()
+    teacher_logprobs_masked[~valid_mask] = -1e9
+    teacher_log_probs_renorm = F.log_softmax(teacher_logprobs_masked, dim=-1)
+
+    # Forward KL: sum_x p_teacher(x) * [log p_teacher(x) - log p_student(x)]
+    teacher_probs_renorm = teacher_log_probs_renorm.exp()
+    per_token_kl = teacher_probs_renorm * (teacher_log_probs_renorm - student_log_probs_renorm)
+    per_token_kl[~valid_mask] = 0.0
+    distillation_losses = per_token_kl.sum(dim=-1)  # (bsz, seqlen)
+
+    # Mass metrics: original (non-renormalized) probability mass in the support set
+    student_log_probs_full = F.log_softmax(student_logits, dim=-1)
+    student_support_log_probs = torch.gather(
+        student_log_probs_full, dim=-1, index=teacher_topk_ids.long()
+    )
+    student_support_probs = student_support_log_probs.exp()
+    student_support_probs[~valid_mask] = 0.0
+    student_mass = student_support_probs.sum(dim=-1)
+
+    teacher_support_probs = teacher_topk_log_probs.exp()
+    teacher_support_probs[~valid_mask] = 0.0
+    teacher_mass = teacher_support_probs.sum(dim=-1)
+
+    return {
+        "distillation_losses": distillation_losses,
+        "student_mass": student_mass,
+        "teacher_mass": teacher_mass,
+    }

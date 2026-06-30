@@ -365,6 +365,7 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
         return
 
     prompt_logprobs_ls, prompt_ids_ls = [], []
+    width = max(num_prompt_logprobs, 1) + (1 if num_prompt_logprobs > 0 else 0)
     # NOTE: logprob of first prompt token is None.
     for logprobs_dict in output.prompt_logprobs[1:]:
         if num_prompt_logprobs == 0:
@@ -373,14 +374,19 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
             prompt_logprobs_ls.append([logprob])
             prompt_ids_ls.append([int(token_id_str)])
         else:
-            prompt_ids = [None] * num_prompt_logprobs
-            prompt_logprobs = [None] * num_prompt_logprobs
+            prompt_ids = [0] * width
+            prompt_logprobs = [0.0] * width
             # We get either top-k logprobs or top-k plus the sampled logprob (if sampled token is not in top-k)
             assert len(logprobs_dict) in [num_prompt_logprobs, num_prompt_logprobs + 1], len(logprobs_dict)
             for token_id_str, token_logprob in logprobs_dict.items():
                 rank = token_logprob.rank
                 if rank > num_prompt_logprobs:
-                    continue  # the sampled token is not in the top-k
+                    # Keep the sampled token in the extra trailing slot so OPD can
+                    # score against the student's actual token even when it is not
+                    # part of the teacher top-k.
+                    prompt_ids[-1] = int(token_id_str)
+                    prompt_logprobs[-1] = token_logprob.logprob
+                    continue
                 logprob = token_logprob.logprob
                 prompt_ids[rank - 1] = int(token_id_str)
                 prompt_logprobs[rank - 1] = logprob
@@ -388,8 +394,8 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
             prompt_ids_ls.append(prompt_ids)
 
     # NOTE: pad a dummy prompt logprob for last prompt token.
-    prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
-    prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
+    prompt_logprobs_ls.append([0.0] * width)
+    prompt_ids_ls.append([0] * width)
 
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls

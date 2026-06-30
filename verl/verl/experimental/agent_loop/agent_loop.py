@@ -908,16 +908,22 @@ class AgentLoopWorker:
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Compute teacher logprobs for single sample."""
+        """Compute teacher logprobs for single sample.
+
+        Uses reformatted teacher input matching its training format:
+        system(relation reasoning) + user(pairs JSON) + assistant(clue text).
+        Falls back to original prompt+response if parsing fails.
+        """
         if self.distillation_enabled and not validate:
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
                 if routing_value is not None:
-                    # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                sequence_ids=prompt_ids + response_ids,
+            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_reformatted(
+                tokenizer=self.tokenizer,
+                prompt_ids=prompt_ids,
+                response_ids=response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,

@@ -115,6 +115,136 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+VG_OPD_REWARD_DENOM = 10.0
+VG_OPD_FORMAT_WEIGHT = 1.0
+VG_OPD_NODE_WEIGHT = 1.0
+VG_OPD_BOX_WEIGHT = 1.0
+VG_OPD_EDGE_WEIGHT = 1.0
+
+
+def _token_span_in_response(tokenizer, response_ids: torch.Tensor, start_text: str, end_text: str) -> torch.Tensor:
+    """Return a boolean mask for tokens inside a tagged response span."""
+    response_len = response_ids.numel()
+    mask = torch.zeros(response_len, dtype=torch.bool, device=response_ids.device)
+    text = tokenizer.decode(response_ids.tolist(), skip_special_tokens=False)
+    lower = text.lower()
+    start = lower.find(start_text.lower())
+    if start < 0:
+        return mask
+    content_start = start + len(start_text)
+    end = lower.find(end_text.lower(), content_start)
+    content_end = end if end >= 0 else len(text)
+
+    offsets = []
+    cursor = 0
+    for token_id in response_ids.tolist():
+        token_text = tokenizer.decode([int(token_id)], skip_special_tokens=False)
+        offsets.append((cursor, cursor + len(token_text)))
+        cursor += len(token_text)
+
+    for idx, (left, right) in enumerate(offsets):
+        if right > content_start and left < content_end:
+            mask[idx] = True
+    return mask
+
+
+def _opd_clue_score(
+    tokenizer,
+    responses: torch.Tensor,
+    response_mask: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    teacher_ids: torch.Tensor | None,
+    teacher_logprobs: torch.Tensor | None,
+) -> list[dict[str, float]]:
+    """Compute per-pair OPD scores from teacher logprobs over <CLUE> tokens.
+
+    Returns a list (one per sample) of dicts mapping "subject_id|object_id" -> opd_score.
+    Each opd_score is exp(-mean_token_loss) over that pair's clue line tokens.
+    Keys use "|" separator to match edge_per_pair from reward function.
+    """
+    import re
+
+    batch_size = responses.shape[0]
+    results: list[dict[str, float]] = [{} for _ in range(batch_size)]
+    if teacher_logprobs is None or teacher_ids is None:
+        return results
+
+    if teacher_ids.dim() == 2:
+        teacher_ids = teacher_ids.unsqueeze(-1)
+    if teacher_logprobs.dim() == 2:
+        teacher_logprobs = teacher_logprobs.unsqueeze(-1)
+    if teacher_ids.shape != teacher_logprobs.shape:
+        return results
+
+    valid_mask = response_mask.bool()
+    for i in range(batch_size):
+        resp_len = int(valid_mask[i].sum().item())
+        if resp_len <= 0:
+            continue
+
+        resp_ids = responses[i, :resp_len]
+        resp_text = tokenizer.decode(resp_ids.tolist(), skip_special_tokens=False)
+        resp_lower = resp_text.lower()
+
+        # Find CLUE content boundaries
+        clue_start = resp_lower.find("<clue>")
+        if clue_start < 0:
+            continue
+        content_start = clue_start + len("<clue>")
+        clue_end = resp_lower.find("</clue>", content_start)
+        content_end = clue_end if clue_end >= 0 else len(resp_text)
+        clue_content = resp_text[content_start:content_end]
+
+        # Build token offsets
+        offsets = []
+        cursor = 0
+        for token_id in resp_ids.tolist():
+            token_text = tokenizer.decode([int(token_id)], skip_special_tokens=False)
+            offsets.append((cursor, cursor + len(token_text)))
+            cursor += len(token_text)
+
+        # Parse clue lines and find their character spans
+        line_pairs = []
+        line_start_char = content_start
+        for line in clue_content.split("\n"):
+            line_end_char = line_start_char + len(line)
+            stripped = line.strip()
+            if stripped:
+                pair_match = re.match(r"\(([^,]+),\s*([^)]+)\)", stripped)
+                if pair_match:
+                    pair_key = f"{pair_match.group(1).strip().lower()}|{pair_match.group(2).strip().lower()}"
+                    line_pairs.append((pair_key, line_start_char, line_end_char))
+            line_start_char = line_end_char + 1  # +1 for the \n
+
+        if not line_pairs:
+            continue
+
+        # For each pair's line, find corresponding tokens and compute OPD score
+        for pair_key, line_char_start, line_char_end in line_pairs:
+            token_losses = []
+            for idx, (left, right) in enumerate(offsets):
+                if right > line_char_start and left < line_char_end:
+                    student_token_id = int(resp_ids[idx].item())
+                    student_lp = old_log_probs[i, idx].float()
+                    t_ids_pos = teacher_ids[i, idx]
+                    t_lps_pos = teacher_logprobs[i, idx].float()
+                    match = t_ids_pos == student_token_id
+                    if match.any():
+                        teacher_lp = t_lps_pos[match].max()
+                    else:
+                        continue
+                    if not torch.isfinite(student_lp):
+                        continue
+                    token_losses.append((student_lp - teacher_lp).abs())
+
+            if token_losses:
+                opd_loss = torch.stack(token_losses).mean()
+                results[i][pair_key] = torch.exp(-opd_loss).clamp(0.0, 1.0).item()
+            else:
+                results[i][pair_key] = 0.0
+
+    return results
+
 
 # ======================================= USER SECTION BEGIN =======================================
 
@@ -1404,13 +1534,106 @@ class PPOTrainer:
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
-        fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        fields = [
+            "uid",
+            "responses",
+            "response_mask",
+            "rm_scores",
+            "rollout_log_probs",
+            "old_log_probs",
+            "teacher_ids",
+            "teacher_logprobs",
+            "extra_fields",
+            "ref_log_prob",
+            "values",
+        ]
         if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
             fields.append("reward_baselines")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         response_mask = data["response_mask"]
+        extra_fields = data.pop("extra_fields").tolist()
+        data["teacher_ids"] = response_from_nested(data.pop("teacher_ids"), response_mask)
+        data["teacher_logprobs"] = response_from_nested(data.pop("teacher_logprobs"), response_mask)
         data = DataProto(batch=data.to_padded_tensor())
+        reward_components = {
+            key: torch.tensor(
+                [
+                    float((extra_field.get("reward_extra_info", {}) if isinstance(extra_field, dict) else {}).get(key, 0.0))
+                    for extra_field in extra_fields
+                ],
+                dtype=torch.float32,
+                device=data.batch["rm_scores"].device,
+            )
+            for key in ("format_reward", "node_acc_reward", "node_box_reward", "edge_reward")
+        }
+        clue_scores_per_pair = _opd_clue_score(
+            tokenizer=self.tokenizer,
+            responses=data.batch["responses"],
+            response_mask=data.batch["response_mask"],
+            old_log_probs=data.batch["old_log_probs"],
+            teacher_ids=data.batch.get("teacher_ids", None),
+            teacher_logprobs=data.batch.get("teacher_logprobs", None),
+        )
+
+        # Compute per-pair weighted edge reward:
+        # For each sample, edge_opd = sum(triplet_score_i * pair_opd_i) / n_gt_rels
+        batch_size = data.batch["responses"].shape[0]
+        device = data.batch["rm_scores"].device
+        edge_reward_opd = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        clue_scores_mean = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        for i, extra_field in enumerate(extra_fields):
+            if not isinstance(extra_field, dict):
+                continue
+            reward_info = extra_field.get("reward_extra_info", {})
+            edge_per_pair = reward_info.get("edge_per_pair", {})
+            n_gt_rels = reward_info.get("n_gt_rels", 1)
+            pair_opd = clue_scores_per_pair[i]
+
+            weighted_sum = 0.0
+            for pair_key, triplet_score in edge_per_pair.items():
+                opd = pair_opd.get(pair_key, 0.0)
+                weighted_sum += triplet_score * opd
+            edge_reward_opd[i] = weighted_sum / max(1, n_gt_rels)
+
+            # Mean OPD for logging
+            if pair_opd:
+                clue_scores_mean[i] = sum(pair_opd.values()) / len(pair_opd)
+
+        # Compute distillation_mask: restrict distillation loss to <CLUE> region only,
+        # since the teacher model is a relation reasoning model (not a scene graph model)
+        # and its logprobs outside <CLUE> are unreliable.
+        distillation_mask = torch.zeros_like(data.batch["response_mask"])
+        for i in range(data.batch["responses"].shape[0]):
+            resp_len = int(data.batch["response_mask"][i].sum().item())
+            if resp_len <= 0:
+                continue
+            clue_mask = _token_span_in_response(
+                self.tokenizer,
+                data.batch["responses"][i, :resp_len],
+                "<CLUE>",
+                "</CLUE>",
+            )
+            distillation_mask[i, :resp_len] = clue_mask.to(distillation_mask.dtype)
+        data.batch["distillation_mask"] = distillation_mask
+        terminal_idx = data.batch["response_mask"].sum(dim=-1).long().sub(1).clamp_min(0)
+        structural_score = (
+            reward_components["format_reward"] * VG_OPD_FORMAT_WEIGHT
+            + reward_components["node_acc_reward"] * VG_OPD_NODE_WEIGHT
+            + reward_components["node_box_reward"] * VG_OPD_BOX_WEIGHT
+            + edge_reward_opd * VG_OPD_EDGE_WEIGHT
+        ) / VG_OPD_REWARD_DENOM
+        data.batch["rm_scores"].zero_()
+        data.batch["rm_scores"][torch.arange(len(data.batch["rm_scores"])), terminal_idx] = structural_score
+        for extra_field, clue_score, score in zip(extra_fields, clue_scores_mean.tolist(), structural_score.tolist(), strict=True):
+            if not isinstance(extra_field, dict):
+                continue
+            reward_info = extra_field.setdefault("reward_extra_info", {})
+            reward_info["clue_reward"] = float(clue_score)
+            reward_info["score"] = float(score)
+        metrics["reward/clue_score_opd"] = clue_scores_mean.mean().item()
+        metrics["reward/edge_reward_opd"] = edge_reward_opd.mean().item()
+        metrics["reward/structural_score_opd"] = structural_score.mean().item()
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
 
@@ -1459,6 +1682,9 @@ class PPOTrainer:
         output = {}
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
+        output["rm_scores"] = response_to_nested(data.batch["rm_scores"], response_mask)
+        if "distillation_mask" in data.batch:
+            output["distillation_mask"] = response_to_nested(data.batch["distillation_mask"], response_mask)
         output = TensorDict(output, batch_size=len(batch))
 
         batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
