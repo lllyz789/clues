@@ -121,6 +121,7 @@ VG_OPD_NODE_WEIGHT = 1.0
 VG_OPD_BOX_WEIGHT = 1.0
 VG_OPD_EDGE_WEIGHT = 1.0
 VG_OPD_EDGE_SCORE_SCALE = 5.0
+VG_OPD_CLUE_GATE_FLOOR = float(os.getenv("VG_OPD_CLUE_GATE_FLOOR", "0.5"))
 
 
 def _token_span_in_response(tokenizer, response_ids: torch.Tensor, start_text: str, end_text: str) -> torch.Tensor:
@@ -144,8 +145,58 @@ def _token_span_in_response(tokenizer, response_ids: torch.Tensor, start_text: s
         cursor += len(token_text)
 
     for idx, (left, right) in enumerate(offsets):
-        if right > content_start and left < content_end:
+        # Only distill tokens fully inside the tag content. Qwen tokenization can
+        # merge the tag boundary with the first clue token (e.g. ">("), and
+        # including that boundary token teaches the model to drop the closing ">".
+        if left >= content_start and right <= content_end:
             mask[idx] = True
+    return mask
+
+
+def _matched_clue_line_token_mask(
+    tokenizer,
+    response_ids: torch.Tensor,
+    allowed_pair_keys: set[str],
+) -> torch.Tensor:
+    """Return a token mask for CLUE lines whose subject-object pair matched a GT edge."""
+    import re
+
+    response_len = response_ids.numel()
+    mask = torch.zeros(response_len, dtype=torch.bool, device=response_ids.device)
+    if not allowed_pair_keys:
+        return mask
+
+    text = tokenizer.decode(response_ids.tolist(), skip_special_tokens=False)
+    lower = text.lower()
+    clue_start = lower.find("<clue>")
+    if clue_start < 0:
+        return mask
+    content_start = clue_start + len("<clue>")
+    clue_end = lower.find("</clue>", content_start)
+    content_end = clue_end if clue_end >= 0 else len(text)
+    clue_content = text[content_start:content_end]
+
+    offsets = []
+    cursor = 0
+    for token_id in response_ids.tolist():
+        token_text = tokenizer.decode([int(token_id)], skip_special_tokens=False)
+        offsets.append((cursor, cursor + len(token_text)))
+        cursor += len(token_text)
+
+    line_start_char = content_start
+    for line in clue_content.split("\n"):
+        line_end_char = line_start_char + len(line)
+        stripped = line.strip()
+        if stripped:
+            pair_match = re.match(r"\(([^,]+),\s*([^)]+)\)", stripped)
+            if pair_match:
+                pair_key = f"{pair_match.group(1).strip().lower()}|{pair_match.group(2).strip().lower()}"
+                if pair_key in allowed_pair_keys:
+                    for idx, (left, right) in enumerate(offsets):
+                        if left >= line_start_char and right <= line_end_char:
+                            mask[idx] = True
+        line_start_char = line_end_char + 1
+
     return mask
 
 
@@ -153,14 +204,13 @@ def _opd_clue_score(
     tokenizer,
     responses: torch.Tensor,
     response_mask: torch.Tensor,
-    old_log_probs: torch.Tensor,
     teacher_ids: torch.Tensor | None,
     teacher_logprobs: torch.Tensor | None,
 ) -> list[dict[str, float]]:
     """Compute per-pair OPD scores from teacher logprobs over <CLUE> tokens.
 
     Returns a list (one per sample) of dicts mapping "subject_id|object_id" -> opd_score.
-    Each opd_score is exp(-mean_token_loss) over that pair's clue line tokens.
+    Each opd_score is exp(mean_teacher_logprob) over that pair's clue line tokens.
     Keys use "|" separator to match edge_per_pair from reward function.
     """
     import re
@@ -222,11 +272,10 @@ def _opd_clue_score(
 
         # For each pair's line, find corresponding tokens and compute OPD score
         for pair_key, line_char_start, line_char_end in line_pairs:
-            token_losses = []
+            teacher_lps = []
             for idx, (left, right) in enumerate(offsets):
-                if right > line_char_start and left < line_char_end:
+                if left >= line_char_start and right <= line_char_end:
                     student_token_id = int(resp_ids[idx].item())
-                    student_lp = old_log_probs[i, idx].float()
                     t_ids_pos = teacher_ids[i, idx]
                     t_lps_pos = teacher_logprobs[i, idx].float()
                     match = t_ids_pos == student_token_id
@@ -234,13 +283,13 @@ def _opd_clue_score(
                         teacher_lp = t_lps_pos[match].max()
                     else:
                         continue
-                    if not torch.isfinite(student_lp):
+                    if not torch.isfinite(teacher_lp):
                         continue
-                    token_losses.append((student_lp - teacher_lp).abs())
+                    teacher_lps.append(teacher_lp)
 
-            if token_losses:
-                opd_loss = torch.stack(token_losses).mean()
-                results[i][pair_key] = torch.exp(-opd_loss).clamp(0.0, 1.0).item()
+            if teacher_lps:
+                mean_teacher_lp = torch.stack(teacher_lps).mean()
+                results[i][pair_key] = torch.exp(mean_teacher_lp).clamp(0.0, 1.0).item()
             else:
                 results[i][pair_key] = 0.0
 
@@ -1572,7 +1621,6 @@ class PPOTrainer:
             tokenizer=self.tokenizer,
             responses=data.batch["responses"],
             response_mask=data.batch["response_mask"],
-            old_log_probs=data.batch["old_log_probs"],
             teacher_ids=data.batch.get("teacher_ids", None),
             teacher_logprobs=data.batch.get("teacher_logprobs", None),
         )
@@ -1594,26 +1642,32 @@ class PPOTrainer:
             weighted_sum = 0.0
             for pair_key, triplet_score in edge_per_pair.items():
                 opd = pair_opd.get(pair_key, 0.0)
-                weighted_sum += triplet_score * opd
+                clue_gate = VG_OPD_CLUE_GATE_FLOOR + (1.0 - VG_OPD_CLUE_GATE_FLOOR) * opd
+                weighted_sum += triplet_score * clue_gate
             edge_reward_opd[i] = (weighted_sum / max(1, n_gt_rels)) * VG_OPD_EDGE_SCORE_SCALE
 
             # Mean OPD for logging
-            if pair_opd:
-                clue_scores_mean[i] = sum(pair_opd.values()) / len(pair_opd)
+            matched_opds = [pair_opd[pair_key] for pair_key in edge_per_pair if pair_key in pair_opd]
+            if matched_opds:
+                clue_scores_mean[i] = sum(matched_opds) / len(matched_opds)
 
-        # Compute distillation_mask: restrict distillation loss to <CLUE> region only,
-        # since the teacher model is a relation reasoning model (not a scene graph model)
-        # and its logprobs outside <CLUE> are unreliable.
+        # Compute distillation_mask: restrict distillation loss to CLUE lines whose
+        # subject-object pairs matched GT edges. This avoids teaching the actor to
+        # imitate teacher reasoning for hallucinated or unmatched relation pairs.
         distillation_mask = torch.zeros_like(data.batch["response_mask"])
         for i in range(data.batch["responses"].shape[0]):
             resp_len = int(data.batch["response_mask"][i].sum().item())
             if resp_len <= 0:
                 continue
-            clue_mask = _token_span_in_response(
+            reward_info = {}
+            if isinstance(extra_fields[i], dict):
+                reward_info = extra_fields[i].get("reward_extra_info", {})
+            edge_per_pair = reward_info.get("edge_per_pair", {})
+            allowed_pair_keys = set(edge_per_pair.keys()) if isinstance(edge_per_pair, dict) else set()
+            clue_mask = _matched_clue_line_token_mask(
                 self.tokenizer,
                 data.batch["responses"][i, :resp_len],
-                "<CLUE>",
-                "</CLUE>",
+                allowed_pair_keys,
             )
             if "teacher_ids" in data.batch:
                 teacher_present = data.batch["teacher_ids"][i, :resp_len] != 0

@@ -298,7 +298,11 @@ class AsyncTeacherLLMServerManager:
 
         clue_token_indices = []
         for idx, (left, right) in enumerate(offsets):
-            if right > content_start and left < content_end:
+            # Keep only tokens fully inside CLUE content. Some tokenizers merge
+            # the tag boundary with the first clue token (e.g. ">("); sending
+            # that token to a teacher trained without <CLUE> tags corrupts the
+            # OPD signal and encourages malformed "<CLUE(...)" outputs.
+            if left >= content_start and right <= content_end:
                 clue_token_indices.append(idx)
 
         if not clue_token_indices:
