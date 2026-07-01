@@ -114,6 +114,12 @@ def compute_distillation_loss_range(
         distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
     else:
         distillation_losses_response = distillation_losses[response_mask.bool()]
+    if distillation_losses_response.numel() == 0:
+        zero = distillation_losses.new_tensor(0.0)
+        return {
+            "distillation/loss_min": Metric(AggregationType.MIN, zero),
+            "distillation/loss_max": Metric(AggregationType.MAX, zero),
+        }
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
@@ -256,6 +262,20 @@ def distillation_loss(
     # Use distillation_mask if present (e.g., to restrict distillation to specific spans)
     distill_mask = data.get("distillation_mask", response_mask)
     loss_agg_mode = config.loss_agg_mode
+
+    if distill_mask.is_nested:
+        distill_token_count = distill_mask.to_padded_tensor(False).sum()
+    else:
+        distill_token_count = distill_mask.sum()
+    if distill_token_count.item() == 0:
+        zero = distillation_losses.sum() * 0.0
+        distillation_metrics.update(
+            {
+                "distillation/loss_min": Metric(AggregationType.MIN, zero.detach()),
+                "distillation/loss_max": Metric(AggregationType.MAX, zero.detach()),
+            }
+        )
+        return zero, distillation_metrics
 
     distillation_metrics.update(
         compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=distill_mask)

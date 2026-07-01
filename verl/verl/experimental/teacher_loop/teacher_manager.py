@@ -307,13 +307,42 @@ class AsyncTeacherLLMServerManager:
         # Build teacher input: prefix + student's actual CLUE token IDs
         prefix_ids = build_teacher_prefix_ids(tokenizer, pairs_json, multi_modal_data)
         student_clue_ids = [response_ids[i] for i in clue_token_indices]
-        teacher_seq_ids = prefix_ids + student_clue_ids
-        prefix_length = len(prefix_ids)
 
         # Call teacher with reformatted input
         teacher_key = self._resolve_teacher_key(routing_key)
         teacher_model_config = self.teacher_model_configs[teacher_key]
         client = self.teacher_client[teacher_key]
+
+        # vLLM needs one token of headroom because this request asks for
+        # max_tokens=1. Keep the run alive for overlong OPD samples and only
+        # distill the CLUE prefix that fits.
+        max_model_len = teacher_model_config.inference.max_model_len
+        if max_model_len is not None:
+            max_prompt_len = max_model_len - 1
+            available_clue_len = max_prompt_len - len(prefix_ids)
+            if available_clue_len <= 0:
+                logger.warning(
+                    "Skipping teacher distillation for overlong reformatted prefix: "
+                    "prefix_len=%s, max_model_len=%s, pairs_json_chars=%s",
+                    len(prefix_ids),
+                    max_model_len,
+                    len(pairs_json),
+                )
+                return default_ids, default_logprobs
+            if len(student_clue_ids) > available_clue_len:
+                logger.warning(
+                    "Truncating teacher CLUE tokens for overlong reformatted input: "
+                    "prefix_len=%s, clue_len=%s, kept_clue_len=%s, max_model_len=%s, pairs_json_chars=%s",
+                    len(prefix_ids),
+                    len(student_clue_ids),
+                    available_clue_len,
+                    max_model_len,
+                    len(pairs_json),
+                )
+                student_clue_ids = student_clue_ids[:available_clue_len]
+
+        teacher_seq_ids = prefix_ids + student_clue_ids
+        prefix_length = len(prefix_ids)
 
         teacher_output = await client.generate(
             request_id=uuid4().hex,

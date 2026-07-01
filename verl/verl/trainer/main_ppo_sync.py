@@ -1615,6 +1615,11 @@ class PPOTrainer:
                 "<CLUE>",
                 "</CLUE>",
             )
+            if "teacher_ids" in data.batch:
+                teacher_present = data.batch["teacher_ids"][i, :resp_len] != 0
+                if teacher_present.dim() > 1:
+                    teacher_present = teacher_present.any(dim=-1)
+                clue_mask = clue_mask & teacher_present.to(device=clue_mask.device)
             distillation_mask[i, :resp_len] = clue_mask.to(distillation_mask.dtype)
         data.batch["distillation_mask"] = distillation_mask
         terminal_idx = data.batch["response_mask"].sum(dim=-1).long().sub(1).clamp_min(0)
