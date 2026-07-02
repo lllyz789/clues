@@ -22,7 +22,9 @@ import torch
 from omegaconf import DictConfig
 from torch.nn import functional as F
 
+from verl.utils.chat_template import apply_chat_template
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
 from verl.workers.config import (
     DistillationConfig,
     DistillationLossConfig,
@@ -185,17 +187,28 @@ def build_teacher_prefix_ids(
     tokenizer,
     pairs_json: str,
     multi_modal_data: Optional[dict[str, Any]] = None,
+    processor: Optional[Any] = None,
 ) -> list[int]:
     """Build teacher prefix token IDs (system + user + generation prompt).
 
     The caller appends the student's actual CLUE token IDs after this prefix.
+
+    When the prompt contains an image, the plain tokenizer only emits a single,
+    unexpanded image placeholder token (e.g. ``<|image_pad|>``). vLLM expands
+    that placeholder to the real per-image token count internally once it sees
+    the actual image data, so encoding with the bare tokenizer under-counts the
+    prefix length and desyncs every position-based index derived from it
+    (``prefix_length`` in ``compute_teacher_logprobs_reformatted``). Route
+    image prompts through the multimodal processor so the returned ids already
+    reflect the expanded placeholder count, matching what vLLM will process.
     """
     user_content = (
         "Generate the complete relation reasoning clues for the following object pairs.\n\n"
         f"Pairs:\n{pairs_json}"
     )
 
-    has_image = multi_modal_data and multi_modal_data.get("images")
+    images = multi_modal_data.get("images") if multi_modal_data else None
+    has_image = bool(images)
     if has_image:
         user_msg_content = [{"type": "image"}, {"type": "text", "text": user_content}]
     else:
@@ -205,6 +218,19 @@ def build_teacher_prefix_ids(
         {"role": "system", "content": _TEACHER_SYSTEM_PROMPT},
         {"role": "user", "content": user_msg_content},
     ]
+
+    if has_image:
+        if processor is None:
+            logger.warning(
+                "build_teacher_prefix_ids: image present but no processor was supplied; falling back to "
+                "unexpanded tokenizer encoding, which will desync teacher evidence-token positions."
+            )
+        else:
+            raw_prompt = apply_chat_template(
+                processor, prefix_msgs, tools=None, add_generation_prompt=True, tokenize=False
+            )
+            model_inputs = build_multimodal_processor_inputs(processor, text=[raw_prompt], images=images)
+            return normalize_token_ids(model_inputs["input_ids"])
 
     prefix_text = tokenizer.apply_chat_template(
         prefix_msgs, tokenize=False, add_generation_prompt=True
@@ -326,6 +352,7 @@ class AsyncTeacherLLMServerManager:
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
+        processor: Optional[Any] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher logprobs using reformatted input matching teacher training format.
 
@@ -369,7 +396,7 @@ class AsyncTeacherLLMServerManager:
             return default_ids, default_logprobs
 
         # Build teacher input: prefix + student's actual evidence token IDs (only)
-        prefix_ids = build_teacher_prefix_ids(tokenizer, pairs_json, multi_modal_data)
+        prefix_ids = build_teacher_prefix_ids(tokenizer, pairs_json, multi_modal_data, processor=processor)
         student_evidence_ids = [response_ids[i] for i in evidence_token_indices]
 
         # Call teacher with reformatted input
