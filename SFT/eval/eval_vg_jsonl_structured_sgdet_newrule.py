@@ -30,7 +30,7 @@ import eval_vg_jsonl_sgdet as base
 
 
 DEFAULT_PRED_JSONL = (
-    "/root/autodl-tmp/lyz/output/erejin_sft/new_acl/sft_v2-20260626-234146_ckpt1758_v2_temp_0.1_test500_pred.jsonl"
+    "/root/autodl-tmp/lyz/output/erejin_sft/clue_sft-20260627-120253_ckpt501_v2_temp_0.7_test500_pred.jsonl"
 )
 
 # Conservative canonical aliases used only for this evaluator. Both predicted

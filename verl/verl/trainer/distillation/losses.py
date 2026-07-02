@@ -517,12 +517,28 @@ def compute_distillation_loss_reverse_kl_estimator(
     - distillation_metrics: Dictionary of metrics.
     """
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
-    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    teacher_log_probs_raw = no_padding_2_padding(data["teacher_logprobs"], data)
+    teacher_ids_raw = no_padding_2_padding(data["teacher_ids"], data)
     if data["response_mask"].is_nested:
         response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
     else:
         response_mask_bool = data["response_mask"].bool()
-    assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
+    response_ids = data["responses"].to_padded_tensor(0) if data["responses"].is_nested else data["responses"]
+    assert (
+        teacher_log_probs_raw.shape[:-1]
+        == teacher_ids_raw.shape[:-1]
+        == student_log_probs.shape
+        == response_mask_bool.shape
+        == response_ids.shape
+    )
+
+    # teacher_ids/teacher_logprobs carry width = num_logprobs + 1: slot 0 is the
+    # teacher's rank-1 pick, and the trailing slot holds the student's actual
+    # token whenever it falls outside rank-1 (see _get_teacher_sampling_params /
+    # extract_prompt_logprobs). Pick whichever slot actually matches the student
+    # token, mirroring the lookup in _opd_clue_score, instead of assuming width 1.
+    matches_rank1 = teacher_ids_raw[..., 0] == response_ids
+    teacher_log_probs = torch.where(matches_rank1, teacher_log_probs_raw[..., 0], teacher_log_probs_raw[..., -1])
 
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
     distillation_losses = kl_penalty(

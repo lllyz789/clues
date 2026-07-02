@@ -131,6 +131,7 @@ swift sft \
     --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
     --deepspeed "${DEEPSPEED}" \
     --save_only_model false \
+    --report_to tensorboard \
     "${RESUME_ARGS[@]}" \
     2>&1 | tee "${LOG_FILE}"
 STATUS=${PIPESTATUS[0]}
