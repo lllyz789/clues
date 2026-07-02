@@ -61,6 +61,7 @@ from verl.experimental.agent_loop import (
 )
 from verl.experimental.reward_loop import RewardLoopManager
 from verl.experimental.teacher_loop import MultiTeacherModelManager
+from verl.experimental.teacher_loop.teacher_manager import _extract_evidence_token_indices
 from verl.protocol import DataProto, DataProtoFuture
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
@@ -207,10 +208,10 @@ def _opd_clue_score(
     teacher_ids: torch.Tensor | None,
     teacher_logprobs: torch.Tensor | None,
 ) -> list[dict[str, float]]:
-    """Compute per-pair OPD scores from teacher logprobs over <CLUE> tokens.
+    """Compute per-pair OPD scores from teacher logprobs over evidence tokens only.
 
     Returns a list (one per sample) of dicts mapping "subject_id|object_id" -> opd_score.
-    Each opd_score is exp(mean_teacher_logprob) over that pair's clue line tokens.
+    Each opd_score is exp(mean_teacher_logprob) over that pair's evidence tokens only.
     Keys use "|" separator to match edge_per_pair from reward function.
     """
     import re
@@ -234,64 +235,108 @@ def _opd_clue_score(
             continue
 
         resp_ids = responses[i, :resp_len]
-        resp_text = tokenizer.decode(resp_ids.tolist(), skip_special_tokens=False)
-        resp_lower = resp_text.lower()
 
-        # Find CLUE content boundaries
-        clue_start = resp_lower.find("<clue>")
-        if clue_start < 0:
+        # Use the exact same evidence-token extractor as teacher_logprobs
+        # mapping, otherwise OPD can read positions the teacher never filled.
+        full_text = tokenizer.decode(resp_ids.tolist(), skip_special_tokens=False)
+        resp_id_list = [int(tok_id) for tok_id in resp_ids.tolist()]
+        evidence_token_indices = set(_extract_evidence_token_indices(full_text, resp_id_list, tokenizer))
+        if not evidence_token_indices:
             continue
-        content_start = clue_start + len("<clue>")
-        clue_end = resp_lower.find("</clue>", content_start)
-        content_end = clue_end if clue_end >= 0 else len(resp_text)
-        clue_content = resp_text[content_start:content_end]
 
-        # Build token offsets
         offsets = []
         cursor = 0
-        for token_id in resp_ids.tolist():
-            token_text = tokenizer.decode([int(token_id)], skip_special_tokens=False)
-            offsets.append((cursor, cursor + len(token_text)))
-            cursor += len(token_text)
+        for tok_id in resp_id_list:
+            tok_str = tokenizer.decode([tok_id], skip_special_tokens=False)
+            offsets.append((cursor, cursor + len(tok_str)))
+            cursor += len(tok_str)
 
-        # Parse clue lines and find their character spans
-        line_pairs = []
-        line_start_char = content_start
-        for line in clue_content.split("\n"):
-            line_end_char = line_start_char + len(line)
-            stripped = line.strip()
-            if stripped:
-                pair_match = re.match(r"\(([^,]+),\s*([^)]+)\)", stripped)
-                if pair_match:
-                    pair_key = f"{pair_match.group(1).strip().lower()}|{pair_match.group(2).strip().lower()}"
-                    line_pairs.append((pair_key, line_start_char, line_end_char))
-            line_start_char = line_end_char + 1  # +1 for the \n
-
-        if not line_pairs:
+        lower_text = full_text.lower()
+        clue_open = lower_text.find("<clue>")
+        if clue_open < 0:
             continue
+        content_start_char = clue_open + len("<clue>")
+        clue_close = lower_text.find("</clue>", content_start_char)
+        content_end_char = clue_close if clue_close >= 0 else len(full_text)
+        clue_text = full_text[content_start_char:content_end_char]
 
-        # For each pair's line, find corresponding tokens and compute OPD score
-        for pair_key, line_char_start, line_char_end in line_pairs:
+        # Pair parsing only assigns the shared evidence-token set to buckets.
+        # It does not independently decide which tokens are evidence.
+        line_token_indices: list[tuple[str, list[int]]] = []
+        line_start_in_clue = 0
+        for line in clue_text.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                line_start_in_clue += len(line) + 1
+                continue
+
+            line_pos_in_clue = clue_text.find(line, line_start_in_clue)
+            if line_pos_in_clue < 0:
+                line_start_in_clue += len(line) + 1
+                continue
+
+            pair_match = re.search(r"\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)", stripped)
+            if pair_match:
+                subject = pair_match.group(1).strip().lower()
+                obj = pair_match.group(2).strip().lower()
+                pair_key = f"{subject}|{obj}"
+
+                type_pos = line.lower().find(" type:")
+                evidence_end_in_line = type_pos if type_pos > 0 else len(line)
+                evidence_start_abs = content_start_char + line_pos_in_clue
+                evidence_end_abs = evidence_start_abs + evidence_end_in_line
+                token_indices = [
+                    idx
+                    for idx, (left, right) in enumerate(offsets)
+                    if idx in evidence_token_indices and left >= evidence_start_abs and right <= evidence_end_abs
+                ]
+                if token_indices:
+                    line_token_indices.append((pair_key, token_indices))
+
+            line_start_in_clue = line_pos_in_clue + len(line) + 1
+
+        _dbg_hit = _dbg_penalty = _dbg_zero_teacher = 0  # diagnostic counters
+        for pair_key, token_indices in line_token_indices:
             teacher_lps = []
-            for idx, (left, right) in enumerate(offsets):
-                if left >= line_char_start and right <= line_char_end:
-                    student_token_id = int(resp_ids[idx].item())
-                    t_ids_pos = teacher_ids[i, idx]
-                    t_lps_pos = teacher_logprobs[i, idx].float()
-                    match = t_ids_pos == student_token_id
-                    if match.any():
-                        teacher_lp = t_lps_pos[match].max()
+
+            for tok_idx in token_indices:
+                student_token_id = int(resp_ids[tok_idx].item())
+                t_ids_pos = teacher_ids[i, tok_idx]
+                t_lps_pos = teacher_logprobs[i, tok_idx].float()
+
+                match = t_ids_pos == student_token_id
+                if match.any():
+                    teacher_lp = t_lps_pos[match].max()
+                    _dbg_hit += 1
+                else:
+                    if t_ids_pos.abs().sum() == 0:
+                        _dbg_zero_teacher += 1
                     else:
-                        continue
-                    if not torch.isfinite(teacher_lp):
-                        continue
-                    teacher_lps.append(teacher_lp)
+                        _dbg_penalty += 1
+                    teacher_lp = torch.tensor(-1.5, device=t_lps_pos.device)  # exp(-1.5) ~= 0.223
+
+                if not torch.isfinite(teacher_lp):
+                    continue
+
+                teacher_lps.append(teacher_lp)
 
             if teacher_lps:
                 mean_teacher_lp = torch.stack(teacher_lps).mean()
                 results[i][pair_key] = torch.exp(mean_teacher_lp).clamp(0.0, 1.0).item()
             else:
                 results[i][pair_key] = 0.0
+
+        if i == 0 and line_token_indices:
+            total = _dbg_hit + _dbg_penalty + _dbg_zero_teacher
+            import logging
+            logging.getLogger(__name__).warning(
+                "[OPD-DBG] sample0 evidence tokens: total=%d  hit(real logp)=%d(%.0f%%)  "
+                "penalty(not-in-topk)=%d(%.0f%%)  zero_teacher(no data)=%d(%.0f%%)",
+                total,
+                _dbg_hit, 100 * _dbg_hit / max(1, total),
+                _dbg_penalty, 100 * _dbg_penalty / max(1, total),
+                _dbg_zero_teacher, 100 * _dbg_zero_teacher / max(1, total),
+            )
 
     return results
 

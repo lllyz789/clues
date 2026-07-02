@@ -142,19 +142,24 @@ def compute_topk_loss(
     """
     loss_mode = distillation_config.distillation_loss.loss_mode
     use_renorm = loss_mode == "forward_kl_topk_renorm"
+    use_jsd = loss_mode == "jsd"
 
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
         case "fsdp" | "veomni":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            if use_renorm:
+            if use_jsd:
+                distillation_loss_fn = fsdp_losses.compute_jsd_topk
+            elif use_renorm:
                 distillation_loss_fn = fsdp_losses.compute_forward_kl_topk_renorm
             else:
                 distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
+            if use_jsd:
+                raise NotImplementedError("jsd is not yet supported for megatron strategy.")
             if use_renorm:
                 raise NotImplementedError("forward_kl_topk_renorm is not yet supported for megatron strategy.")
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
@@ -424,6 +429,70 @@ def compute_forward_kl_topk_renorm(
 
     # After renormalization, KL is always >= 0, but clamp for numerical safety.
     distillation_losses = distillation_losses.clamp_min(0.0)
+
+    return distillation_losses, distillation_metrics
+
+
+@register_distillation_loss(DistillationLossSettings(names=["jsd"], use_topk=True))  # type: ignore[arg-type]
+def compute_jsd_topk(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute Jensen-Shannon Divergence (JSD) distillation loss using top-k log probabilities.
+
+    JSD is a symmetric divergence measure that provides smoother gradients than KL divergence:
+    JSD(P||Q) = 0.5 * KL(P||M) + 0.5 * KL(Q||M), where M = 0.5 * (P + Q).
+
+    Properties:
+    - Symmetric: JSD(P||Q) = JSD(Q||P)
+    - Bounded: JSD ∈ [0, log(2)] ≈ [0, 0.693]
+    - Smoother gradients for better training stability
+    - More balanced exploration compared to forward KL
+
+    Returns:
+    - distillation_losses: (bsz, resp_len)
+    - distillation_metrics: Dictionary of metrics.
+    """
+    distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)
+    student_mass = no_padding_2_padding(model_output["student_mass"], data)
+    teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
+    overlap_count = model_output.get("overlap_count")
+    overlap_token_advantage = model_output.get("overlap_token_advantage")
+
+    if data["response_mask"].is_nested:
+        response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
+    else:
+        response_mask_bool = data["response_mask"].bool()
+    assert distillation_losses.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
+
+    student_mass_valid = student_mass[response_mask_bool]
+    teacher_mass_valid = teacher_mass[response_mask_bool]
+
+    overlap_metrics = {}
+    if overlap_count is not None and overlap_token_advantage is not None:
+        overlap_count = no_padding_2_padding(overlap_count, data)
+        overlap_token_advantage = no_padding_2_padding(overlap_token_advantage, data)
+        overlap_count_valid = overlap_count[response_mask_bool]
+        overlap_token_advantage_valid = overlap_token_advantage[response_mask_bool]
+        overlap_metrics = {
+            "distillation/overlap_count": overlap_count_valid.mean().item(),
+            "distillation/overlap_token_advantage": overlap_token_advantage_valid.mean().item(),
+        }
+
+    distillation_metrics = {
+        "distillation/student_mass": student_mass_valid.mean().item(),
+        "distillation/student_mass_min": Metric(AggregationType.MIN, student_mass_valid.min()),
+        "distillation/student_mass_max": Metric(AggregationType.MAX, student_mass_valid.max()),
+        "distillation/teacher_mass": teacher_mass_valid.mean().item(),
+        "distillation/teacher_mass_min": Metric(AggregationType.MIN, teacher_mass_valid.min()),
+        "distillation/teacher_mass_max": Metric(AggregationType.MAX, teacher_mass_valid.max()),
+        **overlap_metrics,
+    }
+
+    # JSD is bounded [0, log(2)], clamp for numerical safety
+    distillation_losses = distillation_losses.clamp(min=0.0, max=0.693)
 
     return distillation_losses, distillation_metrics
 

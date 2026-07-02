@@ -110,6 +110,77 @@ def _extract_clue_and_pairs_from_response(response_text: str) -> tuple[str | Non
     return clue_text, pairs_json
 
 
+def _extract_evidence_token_indices(
+    response_text: str,
+    response_ids: list[int],
+    tokenizer,
+) -> list[int]:
+    """Extract token indices for evidence portions only (excluding Type/Predicate).
+
+    Returns a list of token indices that correspond to evidence sentences in CLUE,
+    excluding the "Type: ... Final Predicate: ..." suffix on each line.
+    """
+    resp_text_lower = response_text.lower()
+    clue_start_pos = resp_text_lower.find("<clue>")
+    if clue_start_pos < 0:
+        return []
+
+    content_start = clue_start_pos + len("<clue>")
+    clue_end_pos = resp_text_lower.find("</clue>", content_start)
+    content_end = clue_end_pos if clue_end_pos >= 0 else len(response_text)
+
+    # Get full CLUE text
+    clue_text = response_text[content_start:content_end]
+
+    # Build character offset to token index mapping for response_ids
+    offsets = []
+    cursor = 0
+    for token_id in response_ids:
+        token_text = tokenizer.decode([int(token_id)], skip_special_tokens=False)
+        offsets.append((cursor, cursor + len(token_text)))
+        cursor += len(token_text)
+
+    evidence_indices = set()  # Use set to avoid duplicates
+
+    # Process each line to find evidence portions
+    line_start_in_clue = 0
+    for line in clue_text.split("\n"):
+        line_stripped = line.strip()
+        if not line_stripped:
+            line_start_in_clue += len(line) + 1  # +1 for newline
+            continue
+
+        # Find where this line appears in clue_text
+        line_pos_in_clue = clue_text.find(line, line_start_in_clue)
+        if line_pos_in_clue < 0:
+            line_start_in_clue += len(line) + 1
+            continue
+
+        # Find the evidence portion (before " Type:" or " type:")
+        type_pos_in_line = line.lower().find(" type:")
+        if type_pos_in_line > 0:
+            # Extract only up to " Type:"
+            evidence_end_in_line = type_pos_in_line
+        else:
+            # If no "Type:" marker, use the whole line
+            evidence_end_in_line = len(line)
+
+        # Calculate absolute character positions in response_text
+        evidence_start_abs = content_start + line_pos_in_clue
+        evidence_end_abs = content_start + line_pos_in_clue + evidence_end_in_line
+
+        # Find tokens that fall within this evidence range
+        for idx, (left, right) in enumerate(offsets):
+            # Include tokens that are fully within the evidence range
+            if left >= evidence_start_abs and right <= evidence_end_abs:
+                evidence_indices.add(idx)
+
+        line_start_in_clue = line_pos_in_clue + len(line) + 1
+
+    # Return sorted list
+    return sorted(list(evidence_indices))
+
+
 def build_teacher_prefix_ids(
     tokenizer,
     pairs_json: str,
@@ -149,7 +220,12 @@ def _get_teacher_sampling_params(
     if teacher_model_config.inference.temperature != 1.0:
         raise NotImplementedError("vLLM does not support temperature for prompt_logprobs.")
 
-    num_logprobs = distillation_loss_config.topk if distillation_loss_config.loss_settings.use_topk else 0
+    # use_topk=False (estimator-based losses like k1): use 1 so vLLM always
+    # returns the actual sequence token in the trailing slot, even if it is
+    # not the model's top-1 prediction.  prompt_logprobs=0 only returns the
+    # greedy argmax token, which is often different from the student token and
+    # causes ~96% penalty hits in the OPD clue scorer.
+    num_logprobs = distillation_loss_config.topk if distillation_loss_config.loss_settings.use_topk else 1
     return {
         "max_tokens": 1,
         "temperature": teacher_model_config.inference.temperature,
@@ -266,7 +342,11 @@ class AsyncTeacherLLMServerManager:
         """
         total_len = len(prompt_ids) + len(response_ids)
         topk = self.distillation_loss_config.topk or 1
-        width = topk + 1 if self.distillation_loss_config.loss_settings.use_topk else 1
+        # Must match the width vLLM actually returns (see extract_prompt_logprobs /
+        # _get_teacher_sampling_params): num_logprobs top slots plus one trailing
+        # slot for the sampled token when it falls outside the top-k.
+        num_logprobs = topk if self.distillation_loss_config.loss_settings.use_topk else 1
+        width = num_logprobs + 1
 
         default_ids = torch.zeros(total_len, width, dtype=torch.int32)
         default_logprobs = torch.zeros(total_len, width, dtype=torch.float32)
@@ -276,41 +356,21 @@ class AsyncTeacherLLMServerManager:
         # Extract pairs from student <OBJECT> section
         _, pairs_json = _extract_clue_and_pairs_from_response(response_text)
         if pairs_json is None:
-            logger.debug("Failed to extract pairs from student response for teacher reformatting")
+            logger.warning("[TEACHER-DBG] Failed to extract pairs from student response for teacher reformatting")
             return default_ids, default_logprobs
 
-        # Find CLUE span token indices in student response
-        resp_text_lower = response_text.lower()
-        clue_start_pos = resp_text_lower.find("<clue>")
-        if clue_start_pos < 0:
-            return default_ids, default_logprobs
-        content_start = clue_start_pos + len("<clue>")
-        clue_end_pos = resp_text_lower.find("</clue>", content_start)
-        content_end = clue_end_pos if clue_end_pos >= 0 else len(response_text)
+        # Extract token indices for evidence portions only (excluding Type/Predicate)
+        evidence_token_indices = _extract_evidence_token_indices(
+            response_text, response_ids, tokenizer
+        )
 
-        # Map character offsets to token indices
-        offsets = []
-        cursor = 0
-        for token_id in response_ids:
-            token_text = tokenizer.decode([int(token_id)], skip_special_tokens=False)
-            offsets.append((cursor, cursor + len(token_text)))
-            cursor += len(token_text)
-
-        clue_token_indices = []
-        for idx, (left, right) in enumerate(offsets):
-            # Keep only tokens fully inside CLUE content. Some tokenizers merge
-            # the tag boundary with the first clue token (e.g. ">("); sending
-            # that token to a teacher trained without <CLUE> tags corrupts the
-            # OPD signal and encourages malformed "<CLUE(...)" outputs.
-            if left >= content_start and right <= content_end:
-                clue_token_indices.append(idx)
-
-        if not clue_token_indices:
+        if not evidence_token_indices:
+            logger.warning("[TEACHER-DBG] Failed to extract evidence token indices for teacher reformatting")
             return default_ids, default_logprobs
 
-        # Build teacher input: prefix + student's actual CLUE token IDs
+        # Build teacher input: prefix + student's actual evidence token IDs (only)
         prefix_ids = build_teacher_prefix_ids(tokenizer, pairs_json, multi_modal_data)
-        student_clue_ids = [response_ids[i] for i in clue_token_indices]
+        student_evidence_ids = [response_ids[i] for i in evidence_token_indices]
 
         # Call teacher with reformatted input
         teacher_key = self._resolve_teacher_key(routing_key)
@@ -319,12 +379,12 @@ class AsyncTeacherLLMServerManager:
 
         # vLLM needs one token of headroom because this request asks for
         # max_tokens=1. Keep the run alive for overlong OPD samples and only
-        # distill the CLUE prefix that fits.
+        # distill the evidence prefix that fits.
         max_model_len = teacher_model_config.inference.max_model_len
         if max_model_len is not None:
             max_prompt_len = max_model_len - 1
-            available_clue_len = max_prompt_len - len(prefix_ids)
-            if available_clue_len <= 0:
+            available_evidence_len = max_prompt_len - len(prefix_ids)
+            if available_evidence_len <= 0:
                 logger.warning(
                     "Skipping teacher distillation for overlong reformatted prefix: "
                     "prefix_len=%s, max_model_len=%s, pairs_json_chars=%s",
@@ -333,19 +393,19 @@ class AsyncTeacherLLMServerManager:
                     len(pairs_json),
                 )
                 return default_ids, default_logprobs
-            if len(student_clue_ids) > available_clue_len:
+            if len(student_evidence_ids) > available_evidence_len:
                 logger.warning(
-                    "Truncating teacher CLUE tokens for overlong reformatted input: "
-                    "prefix_len=%s, clue_len=%s, kept_clue_len=%s, max_model_len=%s, pairs_json_chars=%s",
+                    "Truncating teacher evidence tokens for overlong reformatted input: "
+                    "prefix_len=%s, evidence_len=%s, kept_evidence_len=%s, max_model_len=%s, pairs_json_chars=%s",
                     len(prefix_ids),
-                    len(student_clue_ids),
-                    available_clue_len,
+                    len(student_evidence_ids),
+                    available_evidence_len,
                     max_model_len,
                     len(pairs_json),
                 )
-                student_clue_ids = student_clue_ids[:available_clue_len]
+                student_evidence_ids = student_evidence_ids[:available_evidence_len]
 
-        teacher_seq_ids = prefix_ids + student_clue_ids
+        teacher_seq_ids = prefix_ids + student_evidence_ids
         prefix_length = len(prefix_ids)
 
         teacher_output = await client.generate(
@@ -365,13 +425,13 @@ class AsyncTeacherLLMServerManager:
         # next token: raw_teacher_ids[j] scores teacher_seq_ids[j + 1].
         # Keep that same convention when mapping back to the full student
         # sequence, because response_from_nested() later left-shifts by one.
-        teacher_clue_len = raw_teacher_ids.shape[0] - prefix_length
-        n_to_map = min(teacher_clue_len, len(clue_token_indices))
+        teacher_evidence_len = raw_teacher_ids.shape[0] - prefix_length
+        n_to_map = min(teacher_evidence_len, len(evidence_token_indices))
         prompt_offset = len(prompt_ids)
 
         for i in range(n_to_map):
             teacher_pos = prefix_length + i - 1
-            student_full_idx = prompt_offset + clue_token_indices[i] - 1
+            student_full_idx = prompt_offset + evidence_token_indices[i] - 1
             if student_full_idx < total_len and teacher_pos < raw_teacher_ids.shape[0]:
                 default_ids[student_full_idx] = raw_teacher_ids[teacher_pos]
                 default_logprobs[student_full_idx] = raw_teacher_logprobs[teacher_pos]

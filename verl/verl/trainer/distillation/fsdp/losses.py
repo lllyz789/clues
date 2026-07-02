@@ -94,6 +94,113 @@ def compute_forward_kl_topk(
     }
 
 
+def compute_jsd_topk(
+    student_logits: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    config: DistillationConfig,
+    data_format: str,
+) -> dict[str, torch.Tensor]:
+    """Compute Jensen-Shannon Divergence (JSD) distillation loss using top-k log probabilities.
+
+    JSD is a symmetric divergence measure:
+    JSD(P||Q) = 0.5 * KL(P||M) + 0.5 * KL(Q||M)
+    where M = 0.5 * (P + Q) is the mixture distribution.
+
+    Properties:
+    - Symmetric: JSD(P||Q) = JSD(Q||P)
+    - Bounded: JSD ∈ [0, log(2)]
+    - Smoother gradients than KL divergence
+    - Encourages balanced exploration
+
+    Args:
+        student_logits: (bsz, seqlen/sp_size, vocab_size).
+        teacher_topk_log_probs: (bsz, seqlen, topk).
+        teacher_topk_ids: (bsz, seqlen, topk).
+        config: DistillationConfig containing loss parameters.
+        data_format: "thd" or "bshd".
+
+    Returns:
+        dict with:
+        - distillation_losses: (bsz, seqlen/sp_size) - JSD values
+        - student_mass: (bsz, seqlen/sp_size) - student prob mass in support
+        - teacher_mass: (bsz, seqlen/sp_size) - teacher prob mass in support
+        - overlap_count: (bsz, seqlen/sp_size) - number of overlapping top-k tokens
+    """
+    assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
+    teacher_topk_log_probs = teacher_topk_log_probs.values().unsqueeze(0)  # (1, total_nnz, topk)
+    teacher_topk_ids = teacher_topk_ids.values().unsqueeze(0)  # (1, total_nnz, topk)
+
+    # 1. Split across sequence parallel groups if needed
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        teacher_topk_log_probs = slice_input_tensor(teacher_topk_log_probs, dim=1)
+        teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1)
+    assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
+
+    # 2. Get student log probabilities
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
+
+    # 3. Gather student log probs at teacher's top-k positions
+    student_topk_log_probs = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
+
+    # 4. Convert to probabilities (for mixing)
+    teacher_topk_probs = teacher_topk_log_probs.exp()  # (bsz, seqlen, topk)
+    student_topk_probs = student_topk_log_probs.exp()  # (bsz, seqlen, topk)
+
+    # 5. Apply optional log prob clamping
+    loss_config: DistillationLossConfig = config.distillation_loss
+    if loss_config.log_prob_min_clamp is not None:
+        student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+        teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+        # Recompute probs after clamping
+        teacher_topk_probs = teacher_topk_log_probs.exp()
+        student_topk_probs = student_topk_log_probs.exp()
+
+    # 6. Compute mixture distribution M = 0.5 * (P_teacher + P_student)
+    mixture_probs = 0.5 * (teacher_topk_probs + student_topk_probs)  # (bsz, seqlen, topk)
+    mixture_log_probs = mixture_probs.clamp_min(1e-10).log()  # Avoid log(0)
+
+    # 7. Compute JSD = 0.5 * KL(teacher||M) + 0.5 * KL(student||M)
+    # KL(teacher||M) = sum_i P_teacher(i) * [log P_teacher(i) - log M(i)]
+    kl_teacher_m = teacher_topk_probs * (teacher_topk_log_probs - mixture_log_probs)
+    kl_teacher_m = kl_teacher_m.sum(dim=-1)  # (bsz, seqlen)
+
+    # KL(student||M) = sum_i P_student(i) * [log P_student(i) - log M(i)]
+    kl_student_m = student_topk_probs * (student_topk_log_probs - mixture_log_probs)
+    kl_student_m = kl_student_m.sum(dim=-1)  # (bsz, seqlen)
+
+    # JSD = 0.5 * (KL_teacher + KL_student)
+    distillation_losses = 0.5 * (kl_teacher_m + kl_student_m)
+
+    # 8. Compute mass metrics (same as forward_kl for consistency)
+    student_mass = student_topk_probs.sum(dim=-1)
+    teacher_mass = teacher_topk_probs.sum(dim=-1)
+
+    # 9. Compute overlap diagnostics (same as forward_kl)
+    student_topk_ids = torch.topk(student_log_probs, k=teacher_topk_ids.shape[-1], dim=-1).indices
+    overlap_mask = (teacher_topk_ids.unsqueeze(-1) == student_topk_ids.unsqueeze(-2)).any(dim=-1)
+    overlap_count = overlap_mask.sum(dim=-1)
+
+    # Compute overlap advantage (how much better on overlapping tokens)
+    token_jsd_contrib = 0.5 * (
+        teacher_topk_probs * (teacher_topk_log_probs - mixture_log_probs) +
+        student_topk_probs * (student_topk_log_probs - mixture_log_probs)
+    )
+    overlap_token_advantage_sum = (-token_jsd_contrib * overlap_mask).sum(dim=-1)
+    overlap_token_advantage = overlap_token_advantage_sum / overlap_count.clamp_min(1)
+    overlap_token_advantage = torch.where(
+        overlap_count > 0, overlap_token_advantage, torch.zeros_like(overlap_token_advantage)
+    )
+
+    return {
+        "distillation_losses": distillation_losses,
+        "student_mass": student_mass,
+        "teacher_mass": teacher_mass,
+        "overlap_count": overlap_count,
+        "overlap_token_advantage": overlap_token_advantage,
+    }
+
+
 def compute_forward_kl_topk_renorm(
     student_logits: torch.Tensor,
     teacher_topk_log_probs: torch.Tensor,
