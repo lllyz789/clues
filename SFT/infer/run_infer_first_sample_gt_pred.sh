@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=${ROOT:-/root/autodl-tmp/lyz}
-CKPT=${CKPT:-/root/autodl-tmp/lyz/output/qwen3_vl_4b_vg_sft_clue/clue_sft-20260627-120253/checkpoint-501}
+CKPT=${CKPT:-/root/autodl-tmp/lyz/output/qwen3_vl_4b_vg_sft_full/sft_v2-20260626-014804/checkpoint-3514}
 
 if [ ! -d "${CKPT}" ]; then
   echo "CKPT directory not found: ${CKPT}" >&2
@@ -16,7 +16,7 @@ if ! compgen -G "${CKPT}/*.safetensors" >/dev/null && ! compgen -G "${CKPT}/pyto
   exit 1
 fi
 TEST_IMAGES_JSON=${TEST_IMAGES_JSON:-${ROOT}/jsondata/vg_test_14700_image_paths.json}
-TRAIN_DATASET_JSONL=${TRAIN_DATASET_JSONL:-/root/autodl-tmp/lyz/jsondata/erejin_datasets/clue_datas/vg_5cls_clue_sft.jsonl}
+TRAIN_DATASET_JSONL=${TRAIN_DATASET_JSONL:-/root/autodl-tmp/lyz/jsondata/erejin_datasets/origin/bbox0-1000/merged_5cls_0-1000_swift_structured.jsonl}
 OUT_DIR=${OUT_DIR:-${ROOT}/output/erejin_sft}
 SPLIT_TAG=${SPLIT_TAG:-test}
 
@@ -31,11 +31,11 @@ INFER_TAG="${CKPT_PARENT}_${CKPT_STEP}_v2"
 #   bash scripts/infer/run_infer_first_sample_gt_pred.sh 100      # infer first 100 test images
 #   NUM_IMAGES=100 bash scripts/infer/run_infer_first_sample_gt_pred.sh
 NUM_IMAGES=${1:-${NUM_IMAGES:-500}}
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-8000}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-6000}
 MODEL_TYPE=${MODEL_TYPE:-qwen3_vl}
 
 # TODO: TEMPERATURE需要设置为1 
-TEMPERATURE=${TEMPERATURE:-0.7}  
+TEMPERATURE=${TEMPERATURE:-1}  
 TOP_P=${TOP_P:-1.0}
 TOP_K=${TOP_K:-0}
 REPETITION_PENALTY=${REPETITION_PENALTY:-1.0}
@@ -65,7 +65,7 @@ export PYTHONPATH="${ROOT}/ms-swift:${PYTHONPATH:-}"
 mkdir -p "${OUT_DIR}"
 
 INFER_DATA="${OUT_DIR}/vg_${SPLIT_TAG}_first_${NUM_IMAGES}.jsonl"
-RESULT_PATH="${RESULT_PATH:-${OUT_DIR}/${INFER_TAG}_temp_${TEMPERATURE}_${SPLIT_TAG}${NUM_IMAGES}_pred.jsonl}"
+RESULT_PATH="${RESULT_PATH:-${OUT_DIR}/${INFER_TAG}_${SPLIT_TAG}${NUM_IMAGES}_pred.jsonl}"
 
 "${PYTHON}" - "${TEST_IMAGES_JSON}" "${TRAIN_DATASET_JSONL}" "${INFER_DATA}" "${NUM_IMAGES}" <<'PYGEN'
 import json

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=/root/autodl-tmp/lyz
-MODEL=${MODEL:-/root/autodl-tmp/lyz/output/qwen3_vl_4b_vg_sft_full/sft_v2-20260626-234146/checkpoint-1758}
+MODEL=${MODEL:-/root/autodl-tmp/lyz/output/qwen3_vl_4b_vg_sft_full/sft_v2-20260626-014804/checkpoint-3514}
 DATASET=${DATASET:-/root/autodl-tmp/lyz/jsondata/erejin_datasets/clue_datas/vg_5cls_clue_sft.jsonl}
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 OUTPUT_DIR=${OUTPUT_DIR:-${ROOT}/output/qwen3_vl_4b_vg_sft_clue/clue_sft-${TIMESTAMP}}
@@ -22,13 +22,13 @@ LOAD_FROM_CACHE_FILE=${LOAD_FROM_CACHE_FILE:-true}
 
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
 AUTO_RESUME=${AUTO_RESUME:-false}
-RESUME_ONLY_MODEL=${RESUME_ONLY_MODEL:-true}
+RESUME_ONLY_MODEL=${RESUME_ONLY_MODEL:-false}
 CREATE_CHECKPOINT_SYMLINK=${CREATE_CHECKPOINT_SYMLINK:-true}
 
 mkdir -p "${OUTPUT_DIR}"
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
-export NPROC_PER_NODE=${NPROC_PER_NODE:-2}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
+export NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 export IMAGE_MAX_TOKEN_NUM=${IMAGE_MAX_TOKEN_NUM:-1024}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
@@ -91,7 +91,6 @@ swift sft \
     --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
     --deepspeed "${DEEPSPEED}" \
     --save_only_model false \
-    --report_to tensorboard \
     "${RESUME_ARGS[@]}" \
     2>&1 | tee "${LOG_FILE}"
 STATUS=${PIPESTATUS[0]}
