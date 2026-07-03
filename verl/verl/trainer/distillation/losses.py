@@ -20,6 +20,7 @@ from tensordict import TensorDict
 
 from verl.base_config import BaseConfig
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.utils import tensordict_utils as tu
 from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
 from verl.workers.utils.losses import ppo_loss
@@ -41,6 +42,25 @@ def is_distillation_enabled(config: Optional[DistillationConfig]) -> bool:
     if config is None:
         return False
     return config.enabled
+
+
+def get_distillation_loss_coef(loss_config: DistillationLossConfig, data: TensorDict) -> float:
+    """Return the current distillation loss coefficient."""
+    if not loss_config.use_task_rewards:
+        return 1.0
+
+    start_coef = loss_config.distillation_loss_coef
+    if not loss_config.distillation_loss_coef_linear_decay:
+        return start_coef
+
+    decay_steps = loss_config.distillation_loss_coef_decay_steps
+    if decay_steps <= 0:
+        return loss_config.distillation_loss_coef_end
+
+    global_steps = tu.get_non_tensor_data(data, "global_steps", 1)
+    step_idx = max(0, int(global_steps) - 1)
+    progress = min(step_idx, decay_steps - 1) / float(max(1, decay_steps - 1))
+    return start_coef + (loss_config.distillation_loss_coef_end - start_coef) * progress
 
 
 @dataclass
@@ -232,11 +252,10 @@ def distillation_ppo_loss(
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)
-    distillation_loss_coef = (
-        distillation_loss_config.distillation_loss_coef if distillation_loss_config.use_task_rewards else 1.0
-    )
+    distillation_loss_coef = get_distillation_loss_coef(distillation_loss_config, data)
     policy_loss += distill_loss * distillation_loss_coef
     policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
+    policy_metrics["distillation/loss_coef"] = Metric(AggregationType.MEAN, distillation_loss_coef)
 
     return policy_loss, policy_metrics
 

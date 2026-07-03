@@ -59,9 +59,13 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from verl.experimental.agent_loop.agent_loop import DictConfigWrap, ToolListWrap, _agent_loop_registry
 from verl.experimental.reward_loop import RewardLoopManager
 from verl.experimental.teacher_loop import MultiTeacherModelManager
-from verl.experimental.teacher_loop.teacher_manager import _extract_evidence_token_indices
+from verl.experimental.teacher_loop.teacher_manager import (
+    _extract_clue_and_pairs_from_response,
+    _extract_evidence_token_indices,
+)
 from verl.protocol import DataProto, DataProtoFuture
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
@@ -97,6 +101,7 @@ from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.ray_utils import auto_await
+from verl.utils.rollout_trace import rollout_trace_attr
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
@@ -121,8 +126,6 @@ VG_OPD_FORMAT_WEIGHT = 1.0
 VG_OPD_NODE_WEIGHT = 1.0
 VG_OPD_BOX_WEIGHT = 1.0
 VG_OPD_EDGE_WEIGHT = 1.0
-VG_OPD_EDGE_SCORE_SCALE = 5.0
-VG_OPD_CLUE_GATE_FLOOR = float(os.getenv("VG_OPD_CLUE_GATE_FLOOR", "0.5"))
 
 
 def _token_span_in_response(tokenizer, response_ids: torch.Tensor, start_text: str, end_text: str) -> torch.Tensor:
@@ -154,18 +157,16 @@ def _token_span_in_response(tokenizer, response_ids: torch.Tensor, start_text: s
     return mask
 
 
-def _matched_clue_line_token_mask(
+def _distill_clue_line_token_mask(
     tokenizer,
     response_ids: torch.Tensor,
-    allowed_pair_keys: set[str],
+    skip_pair_keys: set[str],
 ) -> torch.Tensor:
-    """Return a token mask for CLUE lines whose subject-object pair matched a GT edge."""
+    """Return a token mask for CLUE lines that still need teacher distillation."""
     import re
 
     response_len = response_ids.numel()
     mask = torch.zeros(response_len, dtype=torch.bool, device=response_ids.device)
-    if not allowed_pair_keys:
-        return mask
 
     text = tokenizer.decode(response_ids.tolist(), skip_special_tokens=False)
     lower = text.lower()
@@ -192,7 +193,7 @@ def _matched_clue_line_token_mask(
             pair_match = re.match(r"\(([^,]+),\s*([^)]+)\)", stripped)
             if pair_match:
                 pair_key = f"{pair_match.group(1).strip().lower()}|{pair_match.group(2).strip().lower()}"
-                if pair_key in allowed_pair_keys:
+                if pair_key not in skip_pair_keys:
                     for idx, (left, right) in enumerate(offsets):
                         if left >= line_start_char and right <= line_end_char:
                             mask[idx] = True
@@ -207,26 +208,33 @@ def _opd_clue_score(
     response_mask: torch.Tensor,
     teacher_ids: torch.Tensor | None,
     teacher_logprobs: torch.Tensor | None,
-) -> list[dict[str, float]]:
+) -> tuple[list[dict[str, float]], list[dict]]:
     """Compute per-pair OPD scores from teacher logprobs over evidence tokens only.
 
-    Returns a list (one per sample) of dicts mapping "subject_id|object_id" -> opd_score.
-    Each opd_score is exp(mean_teacher_logprob) over that pair's evidence tokens only.
-    Keys use "|" separator to match edge_per_pair from reward function.
+    Returns a tuple ``(results, diagnostics)``:
+      - ``results``: a list (one per sample) of dicts mapping "subject_id|object_id" -> opd_score.
+        Each opd_score is exp(mean_teacher_logprob) over that pair's evidence tokens only.
+        Keys use "|" separator to match edge_per_pair from reward function.
+      - ``diagnostics``: a list (one per sample) of dicts with per-pair, per-token hit/penalty/
+        zero_teacher breakdowns, for diagnostic dumping (see ``_log_rollout_data``).
     """
     import re
 
     batch_size = responses.shape[0]
     results: list[dict[str, float]] = [{} for _ in range(batch_size)]
+    diagnostics: list[dict] = [
+        {"pairs": [], "total_tokens": 0, "total_hit": 0, "total_penalty": 0, "total_zero_teacher": 0}
+        for _ in range(batch_size)
+    ]
     if teacher_logprobs is None or teacher_ids is None:
-        return results
+        return results, diagnostics
 
     if teacher_ids.dim() == 2:
         teacher_ids = teacher_ids.unsqueeze(-1)
     if teacher_logprobs.dim() == 2:
         teacher_logprobs = teacher_logprobs.unsqueeze(-1)
     if teacher_ids.shape != teacher_logprobs.shape:
-        return results
+        return results, diagnostics
 
     valid_mask = response_mask.bool()
     for i in range(batch_size):
@@ -295,9 +303,17 @@ def _opd_clue_score(
 
             line_start_in_clue = line_pos_in_clue + len(line) + 1
 
-        _dbg_hit = _dbg_penalty = _dbg_zero_teacher = 0  # diagnostic counters
+        sample_diag = diagnostics[i]
         for pair_key, token_indices in line_token_indices:
             teacher_lps = []
+            pair_diag = {
+                "pair_key": pair_key,
+                "n_tokens": len(token_indices),
+                "n_hit": 0,
+                "n_penalty": 0,
+                "n_zero_teacher": 0,
+                "tokens": [],
+            }
 
             for tok_idx in token_indices:
                 student_token_id = int(resp_ids[tok_idx].item())
@@ -307,18 +323,35 @@ def _opd_clue_score(
                 match = t_ids_pos == student_token_id
                 if match.any():
                     teacher_lp = t_lps_pos[match].max()
-                    _dbg_hit += 1
+                    status = "hit"
+                    pair_diag["n_hit"] += 1
                 else:
                     if t_ids_pos.abs().sum() == 0:
-                        _dbg_zero_teacher += 1
+                        status = "zero_teacher"
+                        pair_diag["n_zero_teacher"] += 1
                     else:
-                        _dbg_penalty += 1
+                        status = "penalty"
+                        pair_diag["n_penalty"] += 1
                     teacher_lp = torch.tensor(-1.5, device=t_lps_pos.device)  # exp(-1.5) ~= 0.223
+
+                pair_diag["tokens"].append({
+                    "pos": tok_idx,
+                    "student_token": tokenizer.decode([student_token_id], skip_special_tokens=False),
+                    "status": status,
+                    "teacher_logprob": float(teacher_lp.item()) if torch.isfinite(teacher_lp) else None,
+                })
 
                 if not torch.isfinite(teacher_lp):
                     continue
 
                 teacher_lps.append(teacher_lp)
+
+            pair_diag["hit_rate"] = pair_diag["n_hit"] / max(1, pair_diag["n_tokens"])
+            sample_diag["pairs"].append(pair_diag)
+            sample_diag["total_tokens"] += pair_diag["n_tokens"]
+            sample_diag["total_hit"] += pair_diag["n_hit"]
+            sample_diag["total_penalty"] += pair_diag["n_penalty"]
+            sample_diag["total_zero_teacher"] += pair_diag["n_zero_teacher"]
 
             if teacher_lps:
                 mean_teacher_lp = torch.stack(teacher_lps).mean()
@@ -327,18 +360,18 @@ def _opd_clue_score(
                 results[i][pair_key] = 0.0
 
         if i == 0 and line_token_indices:
-            total = _dbg_hit + _dbg_penalty + _dbg_zero_teacher
+            total = sample_diag["total_tokens"]
             import logging
             logging.getLogger(__name__).warning(
                 "[OPD-DBG] sample0 evidence tokens: total=%d  hit(real logp)=%d(%.0f%%)  "
                 "penalty(not-in-topk)=%d(%.0f%%)  zero_teacher(no data)=%d(%.0f%%)",
                 total,
-                _dbg_hit, 100 * _dbg_hit / max(1, total),
-                _dbg_penalty, 100 * _dbg_penalty / max(1, total),
-                _dbg_zero_teacher, 100 * _dbg_zero_teacher / max(1, total),
+                sample_diag["total_hit"], 100 * sample_diag["total_hit"] / max(1, total),
+                sample_diag["total_penalty"], 100 * sample_diag["total_penalty"] / max(1, total),
+                sample_diag["total_zero_teacher"], 100 * sample_diag["total_zero_teacher"] / max(1, total),
             )
 
-    return results
+    return results, diagnostics
 
 
 # ======================================= USER SECTION BEGIN =======================================
@@ -590,28 +623,115 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             tasks = []
             for i in range(n):
                 task = asyncio.create_task(
-                    self._run_agent_loop(
+                    self._run_agent_loop_raw(
                         run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
                     )
                 )
                 tasks.append(task)
-            await asyncio.gather(*tasks)
+            raw_outputs = await asyncio.gather(*tasks)
+
+            outputs_by_session = []
+            for i, raw_output in enumerate(raw_outputs):
+                outputs = raw_output if isinstance(raw_output, list) else [raw_output]
+                outputs_by_session.append(outputs)
+                await self._compute_score(outputs, kwargs={**prompt, "session_id": i})
+
+            teacher_example = None
+            if not trajectory["validate"]:
+                teacher_example = self._build_teacher_example_from_best_edge_rollout(outputs_by_session)
+
+            for i, outputs in enumerate(outputs_by_session):
+                await self._agent_loop_postprocess(
+                    outputs,
+                    trajectory["validate"],
+                    **prompt,
+                    session_id=i,
+                    __score_ready__=True,
+                    __teacher_example__=teacher_example,
+                )
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
         except Exception as e:
             logger.exception(f"Error in _run_prompt: {e}")
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
 
+    async def _run_agent_loop_raw(
+        self,
+        sampling_params: dict[str, Any],
+        trajectory: dict[str, Any],
+        *,
+        agent_name: str,
+        trace: bool = True,
+        **kwargs,
+    ) -> AgentLoopOutput | list[AgentLoopOutput]:
+        with rollout_trace_attr(
+            step=trajectory["step"],
+            sample_index=trajectory["sample_index"],
+            rollout_n=trajectory["rollout_n"],
+            validate=trajectory["validate"],
+            name="agent_loop",
+            trace=trace,
+        ):
+            assert agent_name in _agent_loop_registry, (
+                f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+            )
+
+            agent_loop_config = _agent_loop_registry[agent_name]
+            agent_loop = hydra.utils.instantiate(
+                config=agent_loop_config,
+                trainer_config=DictConfigWrap(config=self.config),
+                server_manager=self.llm_client,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                dataset_cls=self.dataset_cls,
+                data_config=DictConfigWrap(self.config.data),
+                tools=ToolListWrap(self.tools),
+            )
+            return await agent_loop.run(sampling_params, **kwargs)
+
+    def _build_teacher_example_from_best_edge_rollout(
+        self,
+        outputs_by_session: list[list[AgentLoopOutput]],
+    ) -> dict[str, Any] | None:
+        best = None
+        for session_id, outputs in enumerate(outputs_by_session):
+            if not outputs:
+                continue
+            final_output = outputs[-1]
+            reward_info = final_output.extra_fields.get("reward_extra_info", {})
+            if not isinstance(reward_info, dict):
+                continue
+            try:
+                edge_reward = float(reward_info.get("edge_reward", float("-inf")))
+            except (TypeError, ValueError):
+                continue
+            response_text = self.tokenizer.decode(final_output.response_ids, skip_special_tokens=False)
+            clue_text, pairs_json = _extract_clue_and_pairs_from_response(response_text)
+            if clue_text is None or pairs_json is None:
+                continue
+            if best is None or edge_reward > best["edge_reward"]:
+                best = {
+                    "source": "best_edge_rollout",
+                    "session_id": session_id,
+                    "edge_reward": edge_reward,
+                    "pairs_json": pairs_json,
+                    "clue_text": clue_text,
+                }
+        return best
+
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
     ) -> None:
         """Put agent loop outputs into TransferQueue."""
+        score_ready = kwargs.pop("__score_ready__", False)
+        teacher_example = kwargs.pop("__teacher_example__", None)
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         outputs = output if isinstance(output, list) else [output]
         if not outputs:
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
 
-        await self._compute_score(outputs, kwargs=kwargs)
+        if not score_ready:
+            await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = outputs[-1]
         # TODO: Support output:list[AgentLoopOutput]
@@ -621,6 +741,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             response_ids=final_output.response_ids,
             validate=validate,
             sample_kwargs=kwargs,
+            teacher_example=teacher_example,
         )
 
         if final_output.reward_score is not None:
@@ -751,6 +872,7 @@ class PPOTrainer:
         self._init_tokenizer()
         self._init_dataloader()
         self._init_dump_executor()
+        self._opd_debug_by_key = {}
 
     def _init_tokenizer(self):
         """Initialize tokenizer."""
@@ -1285,6 +1407,30 @@ class PPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    @staticmethod
+    def _write_opd_debug(records, dump_path):
+        """Write per-sample OPD diagnostics as JSONL (runs in background thread)."""
+
+        def json_encode_default(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif torch.is_tensor(obj):
+                return obj.tolist()
+            elif hasattr(obj, "tolist"):
+                return obj.tolist()
+            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+        os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+        with open(dump_path, "w") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False, default=json_encode_default) + "\n")
+
+        print(f"Dumped OPD debug info to {dump_path}")
+
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL asynchronously."""
         global_steps = self.global_steps
@@ -1364,6 +1510,13 @@ class PPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=rollout_data_dir,
             )
+
+            opd_debug_by_key = getattr(self, "_opd_debug_by_key", {})
+            if opd_debug_by_key:
+                records = [opd_debug_by_key.get(batch.keys[i]) for i in sorted_indices]
+                opd_dump_path = os.path.join(rollout_data_dir, "opd_debug", f"{self.global_steps}.jsonl")
+                future = self._dump_executor.submit(self._write_opd_debug, records, opd_dump_path)
+                self._dump_futures.append(future)
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
@@ -1662,43 +1815,34 @@ class PPOTrainer:
             )
             for key in ("format_reward", "node_acc_reward", "node_box_reward", "edge_reward")
         }
-        clue_scores_per_pair = _opd_clue_score(
+        clue_scores_per_pair, opd_diagnostics = _opd_clue_score(
             tokenizer=self.tokenizer,
             responses=data.batch["responses"],
             response_mask=data.batch["response_mask"],
             teacher_ids=data.batch.get("teacher_ids", None),
             teacher_logprobs=data.batch.get("teacher_logprobs", None),
         )
+        self._opd_debug_by_key = {}
 
-        # Compute per-pair weighted edge reward:
-        # For each sample, edge_opd = 5 * sum(triplet_score_i * pair_opd_i) / n_gt_rels
+        # Keep OPD clue scores as diagnostics only. The reward uses the original
+        # edge_reward from the rule reward without an OPD clue gate.
         batch_size = data.batch["responses"].shape[0]
         device = data.batch["rm_scores"].device
-        edge_reward_opd = torch.zeros(batch_size, dtype=torch.float32, device=device)
         clue_scores_mean = torch.zeros(batch_size, dtype=torch.float32, device=device)
         for i, extra_field in enumerate(extra_fields):
             if not isinstance(extra_field, dict):
                 continue
             reward_info = extra_field.get("reward_extra_info", {})
             edge_per_pair = reward_info.get("edge_per_pair", {})
-            n_gt_rels = reward_info.get("n_gt_rels", 1)
             pair_opd = clue_scores_per_pair[i]
-
-            weighted_sum = 0.0
-            for pair_key, triplet_score in edge_per_pair.items():
-                opd = pair_opd.get(pair_key, 0.0)
-                clue_gate = VG_OPD_CLUE_GATE_FLOOR + (1.0 - VG_OPD_CLUE_GATE_FLOOR) * opd
-                weighted_sum += triplet_score * clue_gate
-            edge_reward_opd[i] = (weighted_sum / max(1, n_gt_rels)) * VG_OPD_EDGE_SCORE_SCALE
 
             # Mean OPD for logging
             matched_opds = [pair_opd[pair_key] for pair_key in edge_per_pair if pair_key in pair_opd]
             if matched_opds:
                 clue_scores_mean[i] = sum(matched_opds) / len(matched_opds)
 
-        # Compute distillation_mask: restrict distillation loss to CLUE lines whose
-        # subject-object pairs matched GT edges. This avoids teaching the actor to
-        # imitate teacher reasoning for hallucinated or unmatched relation pairs.
+        # Compute distillation_mask: distill CLUE lines unless the predicted pair
+        # maps to a GT pair and its best triplet similarity is already high enough.
         distillation_mask = torch.zeros_like(data.batch["response_mask"])
         for i in range(data.batch["responses"].shape[0]):
             resp_len = int(data.batch["response_mask"][i].sum().item())
@@ -1707,12 +1851,12 @@ class PPOTrainer:
             reward_info = {}
             if isinstance(extra_fields[i], dict):
                 reward_info = extra_fields[i].get("reward_extra_info", {})
-            edge_per_pair = reward_info.get("edge_per_pair", {})
-            allowed_pair_keys = set(edge_per_pair.keys()) if isinstance(edge_per_pair, dict) else set()
-            clue_mask = _matched_clue_line_token_mask(
+            skip_distill_pair_keys = reward_info.get("skip_distill_pair_keys", [])
+            skip_pair_keys = set(skip_distill_pair_keys) if isinstance(skip_distill_pair_keys, list) else set()
+            clue_mask = _distill_clue_line_token_mask(
                 self.tokenizer,
                 data.batch["responses"][i, :resp_len],
-                allowed_pair_keys,
+                skip_pair_keys,
             )
             if "teacher_ids" in data.batch:
                 teacher_present = data.batch["teacher_ids"][i, :resp_len] != 0
@@ -1726,7 +1870,7 @@ class PPOTrainer:
             reward_components["format_reward"] * VG_OPD_FORMAT_WEIGHT
             + reward_components["node_acc_reward"] * VG_OPD_NODE_WEIGHT
             + reward_components["node_box_reward"] * VG_OPD_BOX_WEIGHT
-            + edge_reward_opd * VG_OPD_EDGE_WEIGHT
+            + reward_components["edge_reward"] * VG_OPD_EDGE_WEIGHT
         ) / VG_OPD_REWARD_DENOM
         data.batch["rm_scores"].zero_()
         data.batch["rm_scores"][torch.arange(len(data.batch["rm_scores"])), terminal_idx] = structural_score
@@ -1736,9 +1880,32 @@ class PPOTrainer:
             reward_info = extra_field.setdefault("reward_extra_info", {})
             reward_info["clue_reward"] = float(clue_score)
             reward_info["score"] = float(score)
+
+        for i in range(data.batch["responses"].shape[0]):
+            extra_field = extra_fields[i] if isinstance(extra_fields[i], dict) else {}
+            reward_info = extra_field.get("reward_extra_info", {})
+            resp_len = int(data.batch["response_mask"][i].sum().item())
+            self._opd_debug_by_key[batch.keys[i]] = {
+                "student_response_text": self.tokenizer.decode(
+                    data.batch["responses"][i, :resp_len].tolist(), skip_special_tokens=True
+                ),
+                "teacher_debug": extra_field.get("teacher_debug"),
+                "opd_diagnostics": opd_diagnostics[i],
+                "edge_per_pair": reward_info.get("edge_per_pair"),
+                "skip_distill_pair_keys": reward_info.get("skip_distill_pair_keys"),
+                "n_gt_rels": reward_info.get("n_gt_rels"),
+                "clue_reward": float(clue_scores_mean[i].item()),
+                "edge_reward": float(reward_components["edge_reward"][i].item()),
+                "structural_score": float(structural_score[i].item()),
+                "distillation_mask_count": int(distillation_mask[i].sum().item()),
+            }
+
+        metrics["reward/format_reward"] = reward_components["format_reward"].mean().item()
+        metrics["reward/node_acc_reward"] = reward_components["node_acc_reward"].mean().item()
+        metrics["reward/node_box_reward"] = reward_components["node_box_reward"].mean().item()
+        metrics["reward/edge_reward"] = reward_components["edge_reward"].mean().item()
         metrics["reward/clue_score_opd"] = clue_scores_mean.mean().item()
-        metrics["reward/edge_reward_opd"] = edge_reward_opd.mean().item()
-        metrics["reward/structural_score_opd"] = structural_score.mean().item()
+        metrics["reward/structural_score"] = structural_score.mean().item()
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
 
@@ -1833,6 +2000,7 @@ class PPOTrainer:
         extra_info = {
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,
+            "global_steps": self.global_steps,
             "global_batch_size": ppo_mini_batch_size,
             "mini_batch_size": ppo_mini_batch_size,
             "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,

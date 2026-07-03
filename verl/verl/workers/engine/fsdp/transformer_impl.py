@@ -403,19 +403,28 @@ class FSDPEngine(BaseEngine):
                 cpu_offload=cpu_offload,
             )
         elif self.engine_config.strategy == "fsdp2":
-            # - actor: offload_policy
-            # - critic: offload_policy
+            # - actor/critic: avoid CPUOffloadPolicy during training. PyTorch FSDP2
+            #   can produce CPU grads in post_backward while sharded params remain on
+            #   CUDA, which crashes when assigning param.grad.
             # - ref: CPUOffloadPolicy(pin_memory=True)
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
             )
             offload_policy = None
-            if self.engine_config.offload_policy or self.engine_config.forward_only:
+            if self.engine_config.forward_only:
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
                 offload_policy = CPUOffloadPolicy(pin_memory=True)
                 self._uses_fsdp2_cpu_offload_policy = True
+            elif self.engine_config.offload_policy:
+                warnings.warn(
+                    "Ignoring fsdp_config.offload_policy=True for FSDP2 training because PyTorch FSDP2 "
+                    "CPUOffloadPolicy may create CPU gradients for CUDA parameters during backward. "
+                    "Use fsdp_config.param_offload/optimizer_offload for manual offload instead.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,

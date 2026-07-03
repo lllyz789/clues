@@ -35,25 +35,48 @@ from verl.workers.rollout.llm_server import LLMServerClient
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-_TEACHER_SYSTEM_PROMPT = (
-    "You are given multiple localized object pairs from one image.\n"
-    "Generate the complete visual evidence relation reasoning clues for all given pairs.\n"
-    "Each output line must use the format:\n"
-    "(subject_id, object_id): evidence sentence Type: relation_type. Final Predicate: predicate\n\n"
-    "Example input:\nPairs:\n[\n  {\n"
-    '    "subject": {"id": "person.1", "bbox": [167, 133, 392, 987]},\n'
-    '    "object": {"id": "sidewalk.1", "bbox": [0, 540, 1000, 999]}\n'
-    "  },\n  {\n"
-    '    "subject": {"id": "umbrella.1", "bbox": [8, 21, 451, 321]},\n'
-    '    "object": {"id": "person.1", "bbox": [167, 133, 392, 987]}\n'
-    "  }\n]\n\n"
-    "Example output:\n"
+_DEFAULT_EXAMPLE_PAIRS = [
+    {
+        "subject": {"id": "person.1", "bbox": [167, 133, 392, 987]},
+        "object": {"id": "sidewalk.1", "bbox": [0, 540, 1000, 999]},
+    },
+    {
+        "subject": {"id": "umbrella.1", "bbox": [8, 21, 451, 321]},
+        "object": {"id": "person.1", "bbox": [167, 133, 392, 987]},
+    },
+]
+_DEFAULT_EXAMPLE_OUTPUT = (
     "(person.1, sidewalk.1): person.1's feet contact sidewalk.1 directly beneath the body. "
     "Type: spatial_relations. Final Predicate: on\n"
     "(umbrella.1, person.1): umbrella.1 is held overhead, covering person.1 from above. "
-    "Type: spatial_relations. Final Predicate: above\n\n"
-    "Do not output extra text."
+    "Type: spatial_relations. Final Predicate: above"
 )
+
+
+def _format_teacher_system_prompt(
+    example_pairs_json: str | None = None,
+    example_output: str | None = None,
+) -> str:
+    pairs_json = example_pairs_json
+    output = (example_output or "").strip()
+    if not pairs_json or not output:
+        pairs_json = json.dumps(_DEFAULT_EXAMPLE_PAIRS, ensure_ascii=False, indent=2)
+        output = _DEFAULT_EXAMPLE_OUTPUT
+    else:
+        try:
+            pairs_json = json.dumps(json.loads(pairs_json), ensure_ascii=False, indent=2)
+        except (json.JSONDecodeError, TypeError):
+            pairs_json = str(pairs_json)
+
+    return (
+        "You are given multiple localized object pairs from one image.\n"
+        "Generate the complete visual evidence relation reasoning clues for all given pairs.\n"
+        "Each output line must use the format:\n"
+        "(subject_id, object_id): evidence sentence Type: relation_type. Final Predicate: predicate\n\n"
+        f"Example input:\nPairs:\n{pairs_json}\n\n"
+        f"Example output:\n{output}\n\n"
+        "Do not output extra text."
+    )
 
 
 def _extract_clue_and_pairs_from_response(response_text: str) -> tuple[str | None, str | None]:
@@ -188,6 +211,8 @@ def build_teacher_prefix_ids(
     pairs_json: str,
     multi_modal_data: Optional[dict[str, Any]] = None,
     processor: Optional[Any] = None,
+    example_pairs_json: str | None = None,
+    example_output: str | None = None,
 ) -> list[int]:
     """Build teacher prefix token IDs (system + user + generation prompt).
 
@@ -215,7 +240,7 @@ def build_teacher_prefix_ids(
         user_msg_content = user_content
 
     prefix_msgs = [
-        {"role": "system", "content": _TEACHER_SYSTEM_PROMPT},
+        {"role": "system", "content": _format_teacher_system_prompt(example_pairs_json, example_output)},
         {"role": "user", "content": user_msg_content},
     ]
 
@@ -353,7 +378,8 @@ class AsyncTeacherLLMServerManager:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
         processor: Optional[Any] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        teacher_example: Optional[dict[str, Any]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Compute teacher logprobs using reformatted input matching teacher training format.
 
         Instead of sending student prompt+response directly, reconstructs teacher input as:
@@ -365,7 +391,8 @@ class AsyncTeacherLLMServerManager:
         Returns teacher_ids and teacher_logprobs with the SAME shape as the original
         (prompt_ids + response_ids) sequence, but only the positions corresponding to
         <CLUE> tokens in the student response have meaningful values; all other positions
-        are filled with zeros.
+        are filled with zeros. Also returns a small JSON-serializable ``teacher_debug`` dict
+        describing exactly what was sent to the teacher, for diagnostic dumping.
         """
         total_len = len(prompt_ids) + len(response_ids)
         topk = self.distillation_loss_config.topk or 1
@@ -384,7 +411,12 @@ class AsyncTeacherLLMServerManager:
         _, pairs_json = _extract_clue_and_pairs_from_response(response_text)
         if pairs_json is None:
             logger.warning("[TEACHER-DBG] Failed to extract pairs from student response for teacher reformatting")
-            return default_ids, default_logprobs
+            return default_ids, default_logprobs, {
+                "status": "no_pairs_json",
+                "pairs_json": None,
+                "prefix_text": None,
+                "prefix_len": None,
+            }
 
         # Extract token indices for evidence portions only (excluding Type/Predicate)
         evidence_token_indices = _extract_evidence_token_indices(
@@ -393,10 +425,28 @@ class AsyncTeacherLLMServerManager:
 
         if not evidence_token_indices:
             logger.warning("[TEACHER-DBG] Failed to extract evidence token indices for teacher reformatting")
-            return default_ids, default_logprobs
+            return default_ids, default_logprobs, {
+                "status": "no_evidence_tokens",
+                "pairs_json": pairs_json,
+                "prefix_text": None,
+                "prefix_len": None,
+            }
 
         # Build teacher input: prefix + student's actual evidence token IDs (only)
-        prefix_ids = build_teacher_prefix_ids(tokenizer, pairs_json, multi_modal_data, processor=processor)
+        example_pairs_json = None
+        example_output = None
+        if teacher_example:
+            example_pairs_json = teacher_example.get("pairs_json")
+            example_output = teacher_example.get("clue_text") or teacher_example.get("output")
+        prefix_ids = build_teacher_prefix_ids(
+            tokenizer,
+            pairs_json,
+            multi_modal_data,
+            processor=processor,
+            example_pairs_json=example_pairs_json,
+            example_output=example_output,
+        )
+        prefix_text = tokenizer.decode(prefix_ids, skip_special_tokens=False)
         student_evidence_ids = [response_ids[i] for i in evidence_token_indices]
 
         # Call teacher with reformatted input
@@ -407,6 +457,8 @@ class AsyncTeacherLLMServerManager:
         # vLLM needs one token of headroom because this request asks for
         # max_tokens=1. Keep the run alive for overlong OPD samples and only
         # distill the evidence prefix that fits.
+        n_evidence_tokens_total = len(student_evidence_ids)
+        truncated = False
         max_model_len = teacher_model_config.inference.max_model_len
         if max_model_len is not None:
             max_prompt_len = max_model_len - 1
@@ -419,7 +471,12 @@ class AsyncTeacherLLMServerManager:
                     max_model_len,
                     len(pairs_json),
                 )
-                return default_ids, default_logprobs
+                return default_ids, default_logprobs, {
+                    "status": "overlong_prefix_skipped",
+                    "pairs_json": pairs_json,
+                    "prefix_text": prefix_text,
+                    "prefix_len": len(prefix_ids),
+                }
             if len(student_evidence_ids) > available_evidence_len:
                 logger.warning(
                     "Truncating teacher evidence tokens for overlong reformatted input: "
@@ -431,6 +488,7 @@ class AsyncTeacherLLMServerManager:
                     len(pairs_json),
                 )
                 student_evidence_ids = student_evidence_ids[:available_evidence_len]
+                truncated = True
 
         teacher_seq_ids = prefix_ids + student_evidence_ids
         prefix_length = len(prefix_ids)
@@ -463,4 +521,14 @@ class AsyncTeacherLLMServerManager:
                 default_ids[student_full_idx] = raw_teacher_ids[teacher_pos]
                 default_logprobs[student_full_idx] = raw_teacher_logprobs[teacher_pos]
 
-        return default_ids, default_logprobs
+        return default_ids, default_logprobs, {
+            "status": "ok",
+            "pairs_json": pairs_json,
+            "prefix_text": prefix_text,
+            "prefix_len": prefix_length,
+            "n_evidence_tokens_total": n_evidence_tokens_total,
+            "n_evidence_tokens_sent": len(student_evidence_ids),
+            "n_evidence_tokens_mapped": n_to_map,
+            "truncated": truncated,
+            "teacher_example": teacher_example,
+        }

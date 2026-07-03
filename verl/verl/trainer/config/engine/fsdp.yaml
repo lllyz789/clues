@@ -15,7 +15,8 @@ param_offload: false
 # Note that this differs from the offload_policy in FSDP
 optimizer_offload: false
 
-# Only for FSDP2: offload param/grad/optimizer during train
+# Only for FSDP2 forward-only/ref models. Training ignores this because CPUOffloadPolicy
+# can produce CPU gradients for CUDA parameters during backward.
 offload_policy: false
 
 # Reshard after forward pass to reduce memory footprint

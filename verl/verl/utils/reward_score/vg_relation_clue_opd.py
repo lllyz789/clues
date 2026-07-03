@@ -1,12 +1,12 @@
 """
-R1-SGG-style reward function for VG scene graph generation with clue-aware OPD reward.
+R1-SGG-style reward function for VG scene graph generation with CLUE tags.
 
 Reward components (matching R1-SGG):
   1. format_reward: checks <CATEGORY>...</CATEGORY><OBJECT>...</OBJECT><CLUE>...</CLUE><RELATION>...</RELATION> structure
   2. node_acc_reward: category semantic similarity via bipartite matching
   3. node_box_reward: GIoU + exp(-L1) of matched object boxes
   4. edge_reward: triplet matching after object bipartite assignment
-  5. clue_reward: filled later from OPD teacher logprobs in the trainer
+  5. clue_reward: diagnostic OPD clue score filled later in the trainer
 
 Uses the local all-MiniLM-L6-v2 embedding model for semantic similarity.
 """
@@ -33,8 +33,10 @@ RELATION_GROUP_KEYS = (
 )
 
 FORMAT_REWARD_WEIGHT = 1.0
-NODE_REWARD_WEIGHT = 2.0
-EDGE_REWARD_WEIGHT = 5.0
+NODE_ACC_REWARD_WEIGHT = 3.0
+NODE_BOX_REWARD_WEIGHT = 2.0
+EDGE_REWARD_WEIGHT = 4.0
+OPD_SKIP_DISTILL_TRIPLET_SIM_THRESHOLD = 0.85
 
 SEM_WEIGHT = 1.0
 IOU_WEIGHT = 2.0
@@ -52,6 +54,10 @@ def _norm_label(value: Any) -> str:
 
 def _category_from_id(obj_id: str) -> str:
     return _norm_label(re.split(r"[#.]|\s+\d+$", str(obj_id), maxsplit=1)[0])
+
+
+def _triplet_text(subject: str, predicate: str, obj: str) -> str:
+    return _norm_label(f"{_category_from_id(subject)} {predicate} {_category_from_id(obj)}")
 
 
 def _safe_bbox(value: Any) -> list[float] | None:
@@ -468,11 +474,14 @@ def _edge_reward(gt_graph: dict, pred_graph: dict) -> float:
 
 
 def _edge_reward_per_pair(gt_graph: dict, pred_graph: dict) -> dict[str, float]:
-    """Compute per-pair edge scores keyed by predicted "subject_id|object_id".
+    """Compute accumulated edge scores keyed by predicted "subject_id|object_id".
 
-    Returns a dict mapping "pred_sub_id|pred_obj_id" -> best triplet score for that pair.
-    Multiple GT triplets mapping to the same pred pair accumulate via max.
-    Uses "|" separator in string key for JSON serialization compatibility.
+    Returns a dict mapping "pred_sub_id|pred_obj_id" -> accumulated triplet score
+    for GT relations that map to that predicted pair. Each GT relation contributes
+    its best full-triplet semantic match, so multiple GT triplets on the same object pair are
+    counted separately. The per-pair breakdown is used for OPD clue diagnostics
+    and distillation masking, not for gating the edge reward. Uses "|" separator
+    in string key for JSON serialization compatibility.
     """
     gt_objs = gt_graph["objects"]
     gt_rels = gt_graph["relations"]
@@ -502,19 +511,59 @@ def _edge_reward_per_pair(gt_graph: dict, pred_graph: dict) -> dict[str, float]:
         obj_mapped = map_obj[obj]
         pred_predicates = pred_pair_to_predicates.get((sub_mapped, obj_mapped))
         if pred_predicates:
-            best_predicate_score = max(
-                semantic_similarity(gt_rel["predicate"], pred_pred)
+            gt_triplet = _triplet_text(sub, gt_rel["predicate"], obj)
+            best_triplet_score = max(
+                semantic_similarity(gt_triplet, _triplet_text(sub_mapped, pred_pred, obj_mapped))
                 for pred_pred in pred_predicates
             )
-            triplet_score = (
-                semantic_similarity(_category_from_id(sub), _category_from_id(sub_mapped))
-                * semantic_similarity(_category_from_id(obj), _category_from_id(obj_mapped))
-                * best_predicate_score
-            )
             key = f"{sub_mapped.lower()}|{obj_mapped.lower()}"
-            pair_scores[key] = max(pair_scores.get(key, 0.0), triplet_score)
+            pair_scores[key] = pair_scores.get(key, 0.0) + best_triplet_score
 
     return pair_scores
+
+
+def _skip_distill_pair_keys(gt_graph: dict, pred_graph: dict) -> list[str]:
+    """Return predicted pair keys whose triplet is already close enough to GT."""
+    gt_objs = gt_graph["objects"]
+    pred_objs = pred_graph["objects"]
+    gt_rels = gt_graph["relations"]
+    pred_rels = pred_graph["relations"]
+    if not gt_rels or not pred_rels:
+        return []
+
+    assignments = bi_match(gt_objs, pred_objs)
+    pred_to_gt = {}
+    for assign in assignments:
+        gt_id = assign["groundtruth"]["id"]
+        pred_id = assign["prediction"]["id"]
+        pred_to_gt[pred_id] = gt_id
+
+    gt_pair_to_rels = {}
+    for rel in gt_rels:
+        gt_pair_to_rels.setdefault((rel["subject"], rel["object"]), []).append(rel)
+
+    skip_keys = set()
+    for pred_rel in pred_rels:
+        pred_sub = pred_rel["subject"]
+        pred_obj = pred_rel["object"]
+        if pred_sub not in pred_to_gt or pred_obj not in pred_to_gt:
+            continue
+
+        gt_sub = pred_to_gt[pred_sub]
+        gt_obj = pred_to_gt[pred_obj]
+        gt_pair_rels = gt_pair_to_rels.get((gt_sub, gt_obj))
+        if not gt_pair_rels:
+            continue
+
+        pred_triplet = _triplet_text(pred_sub, pred_rel["predicate"], pred_obj)
+        best_triplet_sim = max(
+            semantic_similarity(_triplet_text(gt_sub, gt_rel["predicate"], gt_obj), pred_triplet)
+            for gt_rel in gt_pair_rels
+        )
+        if best_triplet_sim >= OPD_SKIP_DISTILL_TRIPLET_SIM_THRESHOLD:
+            skip_keys.add(f"{pred_sub.lower()}|{pred_obj.lower()}")
+
+    return sorted(skip_keys)
 
 
 def compute_score(
@@ -546,7 +595,7 @@ def compute_score(
         partial = dict(zero)
         partial["format_reward"] = fmt * FORMAT_REWARD_WEIGHT
         partial["score"] = fmt * FORMAT_REWARD_WEIGHT / (
-            FORMAT_REWARD_WEIGHT + NODE_REWARD_WEIGHT * 2 + EDGE_REWARD_WEIGHT
+            FORMAT_REWARD_WEIGHT + NODE_ACC_REWARD_WEIGHT + NODE_BOX_REWARD_WEIGHT + EDGE_REWARD_WEIGHT
         )
 
         # Parse ground truth
@@ -573,25 +622,25 @@ def compute_score(
         node_box = _node_box_reward(gt_graph, pred_graph)
         edge = _edge_reward(gt_graph, pred_graph)
         edge_per_pair = _edge_reward_per_pair(gt_graph, pred_graph)
+        skip_distill_pair_keys = _skip_distill_pair_keys(gt_graph, pred_graph)
         n_gt_rels = max(1, len(gt_graph["relations"]))
 
-        # This rule reward only scores GT-observable parts. During training,
-        # main_ppo_sync.py replaces this structural score with
-        # edge_reward * OPD-derived clue_score after teacher logprobs are ready.
+        # This rule reward only scores GT-observable parts.
         score = (
             fmt * FORMAT_REWARD_WEIGHT
-            + node_acc * NODE_REWARD_WEIGHT
-            + node_box * NODE_REWARD_WEIGHT
+            + node_acc * NODE_ACC_REWARD_WEIGHT
+            + node_box * NODE_BOX_REWARD_WEIGHT
             + edge * EDGE_REWARD_WEIGHT
-        ) / (FORMAT_REWARD_WEIGHT + NODE_REWARD_WEIGHT * 2 + EDGE_REWARD_WEIGHT)
+        ) / (FORMAT_REWARD_WEIGHT + NODE_ACC_REWARD_WEIGHT + NODE_BOX_REWARD_WEIGHT + EDGE_REWARD_WEIGHT)
 
         return {
             "score": score,
             "format_reward": fmt * FORMAT_REWARD_WEIGHT,
-            "node_acc_reward": node_acc * NODE_REWARD_WEIGHT,
-            "node_box_reward": node_box * NODE_REWARD_WEIGHT,
+            "node_acc_reward": node_acc * NODE_ACC_REWARD_WEIGHT,
+            "node_box_reward": node_box * NODE_BOX_REWARD_WEIGHT,
             "edge_reward": edge * EDGE_REWARD_WEIGHT,
             "edge_per_pair": edge_per_pair,
+            "skip_distill_pair_keys": skip_distill_pair_keys,
             "n_gt_rels": n_gt_rels,
             "clue_reward": 0.0,
         }

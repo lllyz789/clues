@@ -33,6 +33,11 @@ distillation_loss:
   # The coef of the distillation loss when use_task_rewards is true
   distillation_loss_coef: 1.0
 
+  # Optional linear decay for distillation_loss_coef. Disabled by default.
+  distillation_loss_coef_linear_decay: false
+  distillation_loss_coef_decay_steps: 0
+  distillation_loss_coef_end: 0.0
+
   # Optional max clamp value for distillation loss. If null, no clamping is applied.
   loss_max_clamp: null
 

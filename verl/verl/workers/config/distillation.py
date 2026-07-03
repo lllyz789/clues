@@ -40,6 +40,12 @@ class DistillationLossConfig(BaseConfig):
         Whether to include task rewards alongside distillation loss.
     distillation_loss_coef (float):
         Coefficient for distillation loss when combined with task rewards.
+    distillation_loss_coef_decay_steps (int):
+        Number of training steps over which to linearly decay distillation_loss_coef.
+    distillation_loss_coef_end (float):
+        Final coefficient after linear decay.
+    distillation_loss_coef_linear_decay (bool):
+        Whether to linearly decay distillation_loss_coef to distillation_loss_coef_end.
     loss_max_clamp (float, optional):
         Maximum value to clamp distillation loss. If None, no clamping is applied.
     log_prob_min_clamp (float, optional):
@@ -66,6 +72,9 @@ class DistillationLossConfig(BaseConfig):
     topk: Optional[int] = 128
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
+    distillation_loss_coef_decay_steps: int = 0
+    distillation_loss_coef_end: float = 0.0
+    distillation_loss_coef_linear_decay: bool = False
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 

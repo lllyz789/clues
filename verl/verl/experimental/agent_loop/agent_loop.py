@@ -907,6 +907,7 @@ class AgentLoopWorker:
         response_ids: list[int],
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
+        teacher_example: Optional[dict[str, Any]] = None,
     ) -> None:
         """Compute teacher logprobs for single sample.
 
@@ -920,7 +921,7 @@ class AgentLoopWorker:
                 routing_value = sample_kwargs.get(self.teacher_key)
                 if routing_value is not None:
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_reformatted(
+            teacher_ids, teacher_logprobs, teacher_debug = await self.teacher_server_manager.compute_teacher_logprobs_reformatted(
                 tokenizer=self.tokenizer,
                 prompt_ids=prompt_ids,
                 response_ids=response_ids,
@@ -928,9 +929,11 @@ class AgentLoopWorker:
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
                 processor=self.processor,
+                teacher_example=teacher_example,
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+            output.extra_fields["teacher_debug"] = teacher_debug
 
     def _postprocess(
         self,
