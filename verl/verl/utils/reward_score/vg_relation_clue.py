@@ -6,7 +6,6 @@ Reward components (matching R1-SGG):
   2. node_acc_reward: category semantic similarity via bipartite matching
   3. node_box_reward: GIoU + exp(-L1) of matched object boxes
   4. edge_reward: triplet matching after object bipartite assignment
-  5. clue_reward: diagnostic OPD clue score filled later in the trainer
 
 Uses the local all-MiniLM-L6-v2 embedding model for semantic similarity.
 """
@@ -33,11 +32,9 @@ RELATION_GROUP_KEYS = (
 )
 
 FORMAT_REWARD_WEIGHT = 1.0
-NODE_ACC_REWARD_WEIGHT = 2.0
+NODE_ACC_REWARD_WEIGHT = 3.0
 NODE_BOX_REWARD_WEIGHT = 2.0
-EDGE_REWARD_WEIGHT = 5.0
-EDGE_FULL_MATCH_IOU_THRESHOLD = 0.5
-OPD_SKIP_DISTILL_TRIPLET_SIM_THRESHOLD = 0.85
+EDGE_REWARD_WEIGHT = 4.0
 
 SEM_WEIGHT = 1.0
 IOU_WEIGHT = 2.0
@@ -469,10 +466,7 @@ def _node_box_reward(gt_graph: dict, pred_graph: dict) -> float:
 def _edge_reward(gt_graph: dict, pred_graph: dict) -> float:
     """Compute normalized edge reward averaged over GT relations.
 
-    The weighted edge component is 5 for a strict full match:
-    subject/object categories and predicate match, and both subject/object boxes
-    have IoU >= 0.5. Otherwise it is at most 2.5 via 0.5 * semantic_similarity
-    before the outer EDGE_REWARD_WEIGHT multiplier.
+    The weighted edge component is EDGE_REWARD_WEIGHT * semantic_similarity.
     """
     per_pair = _edge_reward_per_pair(gt_graph, pred_graph)
     if not per_pair:
@@ -486,9 +480,7 @@ def _edge_reward_per_pair(gt_graph: dict, pred_graph: dict) -> dict[str, float]:
     Returns a dict mapping "pred_sub_id|pred_obj_id" -> accumulated triplet score
     for GT relations that map to that predicted pair. Each GT relation contributes
     its best full-triplet semantic match, so multiple GT triplets on the same object pair are
-    counted separately. The per-pair breakdown is used for OPD clue diagnostics
-    and distillation masking, not for gating the edge reward. Uses "|" separator
-    in string key for JSON serialization compatibility.
+    counted separately.
     """
     gt_objs = gt_graph["objects"]
     gt_rels = gt_graph["relations"]
@@ -499,17 +491,15 @@ def _edge_reward_per_pair(gt_graph: dict, pred_graph: dict) -> dict[str, float]:
 
     assignments = bi_match(gt_objs, pred_objs)
     map_obj = {}
-    gt_obj_by_id = {obj["id"]: obj for obj in gt_objs}
-    pred_obj_by_id = {obj["id"]: obj for obj in pred_objs}
     for assign in assignments:
         gt_id = assign["groundtruth"]["id"]
         pred_id = assign["prediction"]["id"]
         map_obj[gt_id] = pred_id
 
-    pred_pair_to_rels = {}
+    pred_pair_to_predicates = {}
     for rel in pred_rels:
         key = (rel["subject"], rel["object"])
-        pred_pair_to_rels.setdefault(key, []).append(rel)
+        pred_pair_to_predicates.setdefault(key, []).append(rel["predicate"])
 
     pair_scores: dict[str, float] = {}
     for gt_rel in gt_rels:
@@ -518,16 +508,12 @@ def _edge_reward_per_pair(gt_graph: dict, pred_graph: dict) -> dict[str, float]:
             continue
         sub_mapped = map_obj[sub]
         obj_mapped = map_obj[obj]
-        pred_pair_rels = pred_pair_to_rels.get((sub_mapped, obj_mapped))
-        if pred_pair_rels:
+        pred_predicates = pred_pair_to_predicates.get((sub_mapped, obj_mapped))
+        if pred_predicates:
+            gt_triplet = _triplet_text(sub, gt_rel["predicate"], obj)
             best_triplet_score = max(
-                _triplet_reward_score(
-                    gt_rel=gt_rel,
-                    pred_rel=pred_rel,
-                    gt_obj_by_id=gt_obj_by_id,
-                    pred_obj_by_id=pred_obj_by_id,
-                )
-                for pred_rel in pred_pair_rels
+                _triplet_reward_score(gt_triplet, _triplet_text(sub_mapped, pred_pred, obj_mapped))
+                for pred_pred in pred_predicates
             )
             key = f"{sub_mapped.lower()}|{obj_mapped.lower()}"
             pair_scores[key] = pair_scores.get(key, 0.0) + best_triplet_score
@@ -535,79 +521,8 @@ def _edge_reward_per_pair(gt_graph: dict, pred_graph: dict) -> dict[str, float]:
     return pair_scores
 
 
-def _triplet_reward_score(
-    gt_rel: dict,
-    pred_rel: dict,
-    gt_obj_by_id: dict[str, dict],
-    pred_obj_by_id: dict[str, dict],
-) -> float:
-    gt_sub, gt_obj = gt_rel["subject"], gt_rel["object"]
-    pred_sub, pred_obj = pred_rel["subject"], pred_rel["object"]
-    gt_triplet = _triplet_text(gt_sub, gt_rel["predicate"], gt_obj)
-    pred_triplet = _triplet_text(pred_sub, pred_rel["predicate"], pred_obj)
-
-    gt_sub_obj = gt_obj_by_id.get(gt_sub)
-    gt_obj_obj = gt_obj_by_id.get(gt_obj)
-    pred_sub_obj = pred_obj_by_id.get(pred_sub)
-    pred_obj_obj = pred_obj_by_id.get(pred_obj)
-    strict_full_match = (
-        gt_sub_obj is not None
-        and gt_obj_obj is not None
-        and pred_sub_obj is not None
-        and pred_obj_obj is not None
-        and _category_from_id(gt_sub) == _category_from_id(pred_sub)
-        and _category_from_id(gt_obj) == _category_from_id(pred_obj)
-        and _norm_label(gt_rel["predicate"]) == _norm_label(pred_rel["predicate"])
-        and compute_iou(gt_sub_obj["bbox"], pred_sub_obj["bbox"]) >= EDGE_FULL_MATCH_IOU_THRESHOLD
-        and compute_iou(gt_obj_obj["bbox"], pred_obj_obj["bbox"]) >= EDGE_FULL_MATCH_IOU_THRESHOLD
-    )
-    if strict_full_match:
-        return 1.0
-    return 0.5 * semantic_similarity(gt_triplet, pred_triplet)
-
-
-def _skip_distill_pair_keys(gt_graph: dict, pred_graph: dict) -> list[str]:
-    """Return predicted pair keys whose triplet is already close enough to GT."""
-    gt_objs = gt_graph["objects"]
-    pred_objs = pred_graph["objects"]
-    gt_rels = gt_graph["relations"]
-    pred_rels = pred_graph["relations"]
-    if not gt_rels or not pred_rels:
-        return []
-
-    assignments = bi_match(gt_objs, pred_objs)
-    pred_to_gt = {}
-    for assign in assignments:
-        gt_id = assign["groundtruth"]["id"]
-        pred_id = assign["prediction"]["id"]
-        pred_to_gt[pred_id] = gt_id
-
-    gt_pair_to_rels = {}
-    for rel in gt_rels:
-        gt_pair_to_rels.setdefault((rel["subject"], rel["object"]), []).append(rel)
-
-    skip_keys = set()
-    for pred_rel in pred_rels:
-        pred_sub = pred_rel["subject"]
-        pred_obj = pred_rel["object"]
-        if pred_sub not in pred_to_gt or pred_obj not in pred_to_gt:
-            continue
-
-        gt_sub = pred_to_gt[pred_sub]
-        gt_obj = pred_to_gt[pred_obj]
-        gt_pair_rels = gt_pair_to_rels.get((gt_sub, gt_obj))
-        if not gt_pair_rels:
-            continue
-
-        pred_triplet = _triplet_text(pred_sub, pred_rel["predicate"], pred_obj)
-        best_triplet_sim = max(
-            semantic_similarity(_triplet_text(gt_sub, gt_rel["predicate"], gt_obj), pred_triplet)
-            for gt_rel in gt_pair_rels
-        )
-        if best_triplet_sim >= OPD_SKIP_DISTILL_TRIPLET_SIM_THRESHOLD:
-            skip_keys.add(f"{pred_sub.lower()}|{pred_obj.lower()}")
-
-    return sorted(skip_keys)
+def _triplet_reward_score(gt_triplet: str, pred_triplet: str) -> float:
+    return semantic_similarity(gt_triplet, pred_triplet)
 
 
 def compute_score(
@@ -627,8 +542,6 @@ def compute_score(
         "node_acc_reward": 0.0,
         "node_box_reward": 0.0,
         "edge_reward": 0.0,
-        "n_gt_rels": 0,
-        "clue_reward": 0.0,
     }
 
     try:
@@ -666,9 +579,6 @@ def compute_score(
         node_acc = _node_acc_reward(gt_graph, pred_graph)
         node_box = _node_box_reward(gt_graph, pred_graph)
         edge = _edge_reward(gt_graph, pred_graph)
-        edge_per_pair = _edge_reward_per_pair(gt_graph, pred_graph)
-        skip_distill_pair_keys = _skip_distill_pair_keys(gt_graph, pred_graph)
-        n_gt_rels = max(1, len(gt_graph["relations"]))
 
         # This rule reward only scores GT-observable parts.
         score = (
@@ -684,10 +594,6 @@ def compute_score(
             "node_acc_reward": node_acc * NODE_ACC_REWARD_WEIGHT,
             "node_box_reward": node_box * NODE_BOX_REWARD_WEIGHT,
             "edge_reward": edge * EDGE_REWARD_WEIGHT,
-            "edge_per_pair": edge_per_pair,
-            "skip_distill_pair_keys": skip_distill_pair_keys,
-            "n_gt_rels": n_gt_rels,
-            "clue_reward": 0.0,
         }
     except Exception:
         return zero

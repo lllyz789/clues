@@ -73,7 +73,7 @@ from verl.single_controller.ray import (
     ResourcePoolManager,
     create_colocated_worker_cls,
 )
-from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation import is_distillation_enabled, is_distillation_loss_active
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
@@ -1782,6 +1782,7 @@ class PPOTrainer:
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
+        distillation_active = is_distillation_loss_active(self.distillation_config, global_steps=self.global_steps)
         fields = [
             "uid",
             "responses",
@@ -1789,20 +1790,21 @@ class PPOTrainer:
             "rm_scores",
             "rollout_log_probs",
             "old_log_probs",
-            "teacher_ids",
-            "teacher_logprobs",
             "extra_fields",
             "ref_log_prob",
             "values",
         ]
+        if distillation_active:
+            fields.extend(["teacher_ids", "teacher_logprobs"])
         if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
             fields.append("reward_baselines")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         response_mask = data["response_mask"]
         extra_fields = data.pop("extra_fields").tolist()
-        data["teacher_ids"] = response_from_nested(data.pop("teacher_ids"), response_mask)
-        data["teacher_logprobs"] = response_from_nested(data.pop("teacher_logprobs"), response_mask)
+        if distillation_active:
+            data["teacher_ids"] = response_from_nested(data.pop("teacher_ids"), response_mask)
+            data["teacher_logprobs"] = response_from_nested(data.pop("teacher_logprobs"), response_mask)
         data = DataProto(batch=data.to_padded_tensor())
         reward_components = {
             key: torch.tensor(
@@ -1992,13 +1994,15 @@ class PPOTrainer:
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
+        distillation_active = is_distillation_loss_active(self.distillation_config, global_steps=self.global_steps)
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
-            if is_distillation_enabled(self.config.get("distillation"))
+            if distillation_active
             else False
         )
         extra_info = {
             "calculate_entropy": calculate_entropy,
+            "distillation_active": distillation_active,
             "distillation_use_topk": distillation_use_topk,
             "global_steps": self.global_steps,
             "global_batch_size": ppo_mini_batch_size,

@@ -44,8 +44,8 @@ def is_distillation_enabled(config: Optional[DistillationConfig]) -> bool:
     return config.enabled
 
 
-def get_distillation_loss_coef(loss_config: DistillationLossConfig, data: TensorDict) -> float:
-    """Return the current distillation loss coefficient."""
+def get_distillation_loss_coef_for_step(loss_config: DistillationLossConfig, global_steps: int = 1) -> float:
+    """Return the distillation loss coefficient for a training step."""
     if not loss_config.use_task_rewards:
         return 1.0
 
@@ -57,10 +57,33 @@ def get_distillation_loss_coef(loss_config: DistillationLossConfig, data: Tensor
     if decay_steps <= 0:
         return loss_config.distillation_loss_coef_end
 
-    global_steps = tu.get_non_tensor_data(data, "global_steps", 1)
     step_idx = max(0, int(global_steps) - 1)
     progress = min(step_idx, decay_steps - 1) / float(max(1, decay_steps - 1))
     return start_coef + (loss_config.distillation_loss_coef_end - start_coef) * progress
+
+
+def get_distillation_loss_coef(loss_config: DistillationLossConfig, data: TensorDict) -> float:
+    """Return the current distillation loss coefficient."""
+    global_steps = tu.get_non_tensor_data(data, "global_steps", 1)
+    return get_distillation_loss_coef_for_step(loss_config, global_steps=global_steps)
+
+
+def is_distillation_loss_active(
+    distillation_config: Optional[DistillationConfig],
+    data: Optional[TensorDict] = None,
+    global_steps: Optional[int] = None,
+) -> bool:
+    """Whether the current step should compute teacher distillation."""
+    if not is_distillation_enabled(distillation_config):
+        return False
+    if data is not None:
+        coef = get_distillation_loss_coef(distillation_config.distillation_loss, data)
+    else:
+        coef = get_distillation_loss_coef_for_step(
+            distillation_config.distillation_loss,
+            global_steps=1 if global_steps is None else global_steps,
+        )
+    return coef > 0.0
 
 
 @dataclass
@@ -240,6 +263,9 @@ def distillation_ppo_loss(
     """
 
     # Called as logits processor
+    if not is_distillation_loss_active(distillation_config, data=data):
+        return {} if student_logits is not None else ppo_loss(config, model_output, data, dp_group)
+
     if student_logits is not None:
         return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
 

@@ -48,7 +48,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
-from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation import is_distillation_enabled, is_distillation_loss_active
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
@@ -426,6 +426,7 @@ class AgentLoopWorker:
         if self.distillation_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
+            self.distillation_config = omega_conf_to_dataclass(config.distillation)
             self.teacher_key: str = config.distillation.teacher_key
             self.teacher_server_manager = AsyncTeacherLLMServerManager(
                 config=config,
@@ -915,7 +916,16 @@ class AgentLoopWorker:
         system(relation reasoning) + user(pairs JSON) + assistant(clue text).
         Falls back to original prompt+response if parsing fails.
         """
-        if self.distillation_enabled and not validate:
+        global_steps = 1
+        if sample_kwargs is not None:
+            raw_global_steps = sample_kwargs.get("global_steps", 1)
+            global_steps = raw_global_steps.item() if hasattr(raw_global_steps, "item") else raw_global_steps
+
+        if (
+            self.distillation_enabled
+            and not validate
+            and is_distillation_loss_active(self.distillation_config, global_steps=int(global_steps))
+        ):
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
@@ -987,9 +997,9 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        reward_extra_keys = list(dict.fromkeys(key for info in reward_extra_infos for key in info))
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            non_tensor_batch[key] = np.array([info.get(key, 0.0) for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
