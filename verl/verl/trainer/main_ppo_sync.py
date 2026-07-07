@@ -636,10 +636,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 outputs_by_session.append(outputs)
                 await self._compute_score(outputs, kwargs={**prompt, "session_id": i})
 
-            teacher_example = None
-            if not trajectory["validate"]:
-                teacher_example = self._build_teacher_example_from_best_edge_rollout(outputs_by_session)
-
             for i, outputs in enumerate(outputs_by_session):
                 await self._agent_loop_postprocess(
                     outputs,
@@ -647,7 +643,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     **prompt,
                     session_id=i,
                     __score_ready__=True,
-                    __teacher_example__=teacher_example,
                 )
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
         except Exception as e:
@@ -688,42 +683,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             )
             return await agent_loop.run(sampling_params, **kwargs)
 
-    def _build_teacher_example_from_best_edge_rollout(
-        self,
-        outputs_by_session: list[list[AgentLoopOutput]],
-    ) -> dict[str, Any] | None:
-        best = None
-        for session_id, outputs in enumerate(outputs_by_session):
-            if not outputs:
-                continue
-            final_output = outputs[-1]
-            reward_info = final_output.extra_fields.get("reward_extra_info", {})
-            if not isinstance(reward_info, dict):
-                continue
-            try:
-                edge_reward = float(reward_info.get("edge_reward", float("-inf")))
-            except (TypeError, ValueError):
-                continue
-            response_text = self.tokenizer.decode(final_output.response_ids, skip_special_tokens=False)
-            clue_text, pairs_json = _extract_clue_and_pairs_from_response(response_text)
-            if clue_text is None or pairs_json is None:
-                continue
-            if best is None or edge_reward > best["edge_reward"]:
-                best = {
-                    "source": "best_edge_rollout",
-                    "session_id": session_id,
-                    "edge_reward": edge_reward,
-                    "pairs_json": pairs_json,
-                    "clue_text": clue_text,
-                }
-        return best
-
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
     ) -> None:
         """Put agent loop outputs into TransferQueue."""
         score_ready = kwargs.pop("__score_ready__", False)
-        teacher_example = kwargs.pop("__teacher_example__", None)
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         outputs = output if isinstance(output, list) else [output]
         if not outputs:
@@ -741,7 +705,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             response_ids=final_output.response_ids,
             validate=validate,
             sample_kwargs=kwargs,
-            teacher_example=teacher_example,
         )
 
         if final_output.reward_score is not None:

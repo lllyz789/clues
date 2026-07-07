@@ -908,7 +908,6 @@ class AgentLoopWorker:
         response_ids: list[int],
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
-        teacher_example: Optional[dict[str, Any]] = None,
     ) -> None:
         """Compute teacher logprobs for single sample.
 
@@ -939,7 +938,6 @@ class AgentLoopWorker:
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
                 processor=self.processor,
-                teacher_example=teacher_example,
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs

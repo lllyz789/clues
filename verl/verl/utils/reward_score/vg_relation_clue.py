@@ -32,9 +32,10 @@ RELATION_GROUP_KEYS = (
 )
 
 FORMAT_REWARD_WEIGHT = 1.0
-NODE_ACC_REWARD_WEIGHT = 3.0
+NODE_ACC_REWARD_WEIGHT = 2.0
 NODE_BOX_REWARD_WEIGHT = 2.0
-EDGE_REWARD_WEIGHT = 4.0
+EDGE_REWARD_WEIGHT = 5.0
+EDGE_FULL_MATCH_IOU_THRESHOLD = 0.5
 
 SEM_WEIGHT = 1.0
 IOU_WEIGHT = 2.0
@@ -466,7 +467,10 @@ def _node_box_reward(gt_graph: dict, pred_graph: dict) -> float:
 def _edge_reward(gt_graph: dict, pred_graph: dict) -> float:
     """Compute normalized edge reward averaged over GT relations.
 
-    The weighted edge component is EDGE_REWARD_WEIGHT * semantic_similarity.
+    The weighted edge component is 5 for a strict full match:
+    subject/object categories and predicate match, and both subject/object boxes
+    have IoU >= 0.5. Otherwise it is at most 2.5 via 0.5 * semantic_similarity
+    before the outer EDGE_REWARD_WEIGHT multiplier.
     """
     per_pair = _edge_reward_per_pair(gt_graph, pred_graph)
     if not per_pair:
@@ -496,10 +500,13 @@ def _edge_reward_per_pair(gt_graph: dict, pred_graph: dict) -> dict[str, float]:
         pred_id = assign["prediction"]["id"]
         map_obj[gt_id] = pred_id
 
-    pred_pair_to_predicates = {}
+    gt_obj_by_id = {obj["id"]: obj for obj in gt_objs}
+    pred_obj_by_id = {obj["id"]: obj for obj in pred_objs}
+
+    pred_pair_to_rels = {}
     for rel in pred_rels:
         key = (rel["subject"], rel["object"])
-        pred_pair_to_predicates.setdefault(key, []).append(rel["predicate"])
+        pred_pair_to_rels.setdefault(key, []).append(rel)
 
     pair_scores: dict[str, float] = {}
     for gt_rel in gt_rels:
@@ -508,12 +515,16 @@ def _edge_reward_per_pair(gt_graph: dict, pred_graph: dict) -> dict[str, float]:
             continue
         sub_mapped = map_obj[sub]
         obj_mapped = map_obj[obj]
-        pred_predicates = pred_pair_to_predicates.get((sub_mapped, obj_mapped))
-        if pred_predicates:
-            gt_triplet = _triplet_text(sub, gt_rel["predicate"], obj)
+        pred_pair_rels = pred_pair_to_rels.get((sub_mapped, obj_mapped))
+        if pred_pair_rels:
             best_triplet_score = max(
-                _triplet_reward_score(gt_triplet, _triplet_text(sub_mapped, pred_pred, obj_mapped))
-                for pred_pred in pred_predicates
+                _triplet_reward_score(
+                    gt_rel=gt_rel,
+                    pred_rel=pred_rel,
+                    gt_obj_by_id=gt_obj_by_id,
+                    pred_obj_by_id=pred_obj_by_id,
+                )
+                for pred_rel in pred_pair_rels
             )
             key = f"{sub_mapped.lower()}|{obj_mapped.lower()}"
             pair_scores[key] = pair_scores.get(key, 0.0) + best_triplet_score
@@ -521,8 +532,35 @@ def _edge_reward_per_pair(gt_graph: dict, pred_graph: dict) -> dict[str, float]:
     return pair_scores
 
 
-def _triplet_reward_score(gt_triplet: str, pred_triplet: str) -> float:
-    return semantic_similarity(gt_triplet, pred_triplet)
+def _triplet_reward_score(
+    gt_rel: dict,
+    pred_rel: dict,
+    gt_obj_by_id: dict[str, dict],
+    pred_obj_by_id: dict[str, dict],
+) -> float:
+    gt_sub, gt_obj = gt_rel["subject"], gt_rel["object"]
+    pred_sub, pred_obj = pred_rel["subject"], pred_rel["object"]
+    gt_triplet = _triplet_text(gt_sub, gt_rel["predicate"], gt_obj)
+    pred_triplet = _triplet_text(pred_sub, pred_rel["predicate"], pred_obj)
+
+    gt_sub_obj = gt_obj_by_id.get(gt_sub)
+    gt_obj_obj = gt_obj_by_id.get(gt_obj)
+    pred_sub_obj = pred_obj_by_id.get(pred_sub)
+    pred_obj_obj = pred_obj_by_id.get(pred_obj)
+    strict_full_match = (
+        gt_sub_obj is not None
+        and gt_obj_obj is not None
+        and pred_sub_obj is not None
+        and pred_obj_obj is not None
+        and _category_from_id(gt_sub) == _category_from_id(pred_sub)
+        and _category_from_id(gt_obj) == _category_from_id(pred_obj)
+        and _norm_label(gt_rel["predicate"]) == _norm_label(pred_rel["predicate"])
+        and compute_iou(gt_sub_obj["bbox"], pred_sub_obj["bbox"]) >= EDGE_FULL_MATCH_IOU_THRESHOLD
+        and compute_iou(gt_obj_obj["bbox"], pred_obj_obj["bbox"]) >= EDGE_FULL_MATCH_IOU_THRESHOLD
+    )
+    if strict_full_match:
+        return 1.0
+    return 0.5 * semantic_similarity(gt_triplet, pred_triplet)
 
 
 def compute_score(

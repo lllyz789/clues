@@ -378,7 +378,6 @@ class AsyncTeacherLLMServerManager:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
         processor: Optional[Any] = None,
-        teacher_example: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Compute teacher logprobs using reformatted input matching teacher training format.
 
@@ -433,18 +432,11 @@ class AsyncTeacherLLMServerManager:
             }
 
         # Build teacher input: prefix + student's actual evidence token IDs (only)
-        example_pairs_json = None
-        example_output = None
-        if teacher_example:
-            example_pairs_json = teacher_example.get("pairs_json")
-            example_output = teacher_example.get("clue_text") or teacher_example.get("output")
         prefix_ids = build_teacher_prefix_ids(
             tokenizer,
             pairs_json,
             multi_modal_data,
             processor=processor,
-            example_pairs_json=example_pairs_json,
-            example_output=example_output,
         )
         prefix_text = tokenizer.decode(prefix_ids, skip_special_tokens=False)
         student_evidence_ids = [response_ids[i] for i in evidence_token_indices]
@@ -530,5 +522,4 @@ class AsyncTeacherLLMServerManager:
             "n_evidence_tokens_sent": len(student_evidence_ids),
             "n_evidence_tokens_mapped": n_to_map,
             "truncated": truncated,
-            "teacher_example": teacher_example,
         }
