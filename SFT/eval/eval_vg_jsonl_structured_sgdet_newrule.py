@@ -39,14 +39,18 @@ OBJECT_CANONICAL_ALIASES = {
     "airplane": "plane",
     "boy": "person",
     "child": "person",
+    "desk": "table",
     "girl": "person",
     "guy": "person",
+    "hill": "mountain",
     "kid": "person",
     "lady": "person",
+    "lamp": "light",
     "man": "person",
     "men": "person",
     "people": "person",
     "player": "person",
+    "seat": "chair",
     "skier": "person",
     "woman": "person",
     "boot": "shoe",
@@ -59,6 +63,171 @@ OBJECT_CANONICAL_ALIASES = {
 PREDICATE_CANONICAL_ALIASES = {
     "wears": "wearing",
     "laying on": "lying on",
+}
+
+PREDICATE_NAME_ALIASES = {
+    "across from": "near",
+    "around": "near",
+    "below": "under",
+    "beneath": "under",
+    "beside": "near",
+    "close to": "near",
+    "connected to": "attached to",
+    "drawn on": "painted on",
+    "fixed to": "attached to",
+    "higher than": "above",
+    "laid on": "lying on",
+    "lay on": "lying on",
+    "left of": "near",
+    "lower than": "under",
+    "nearby": "near",
+    "perched on": "sitting on",
+    "resting on": "on",
+    "right of": "near",
+    "to the left of": "near",
+    "to the right of": "near",
+    "written on": "says",
+}
+
+TRIPLET_PREDICATE_ALIASES = [
+    {
+        "subject": "person",
+        "predicate": "on",
+        "objects": ("bike", "horse", "motorcycle", "skateboard", "ski", "surfboard"),
+        "target": "riding",
+    },
+    {
+        "subject": "person",
+        "predicate": "sitting on",
+        "objects": ("bike", "horse", "motorcycle", "skateboard", "ski", "surfboard"),
+        "target": "riding",
+    },
+    {
+        "subject": "person",
+        "predicate": "on",
+        "objects": ("bed", "bench", "chair", "seat"),
+        "target": "sitting on",
+    },
+    {
+        "subject": "person",
+        "predicate": "at",
+        "objects": ("bench", "chair", "seat"),
+        "target": "sitting on",
+    },
+    {
+        "subject": "person",
+        "predicate": "has",
+        "objects": (
+            "boot",
+            "cap",
+            "coat",
+            "glove",
+            "hat",
+            "helmet",
+            "jacket",
+            "jean",
+            "pant",
+            "shirt",
+            "shoe",
+            "short",
+            "sneaker",
+            "sock",
+            "tie",
+        ),
+        "target": "wearing",
+    },
+    {
+        "subject": "person",
+        "predicate": "on",
+        "objects": (
+            "boot",
+            "cap",
+            "coat",
+            "glove",
+            "hat",
+            "helmet",
+            "jacket",
+            "jean",
+            "pant",
+            "shirt",
+            "shoe",
+            "short",
+            "sneaker",
+            "sock",
+            "tie",
+        ),
+        "target": "wearing",
+    },
+    {
+        "subject": "person",
+        "predicate": "with",
+        "objects": (
+            "boot",
+            "cap",
+            "coat",
+            "glove",
+            "hat",
+            "helmet",
+            "jacket",
+            "jean",
+            "pant",
+            "shirt",
+            "shoe",
+            "short",
+            "sneaker",
+            "sock",
+            "tie",
+        ),
+        "target": "wearing",
+    },
+    {
+        "subject": "person",
+        "predicate": "with",
+        "objects": ("bag", "book", "bottle", "cup", "fork", "phone", "plate", "racket", "umbrella"),
+        "target": "holding",
+    },
+    {
+        "subject": "person",
+        "predicate": "has",
+        "objects": ("bag", "book", "bottle", "cup", "fork", "phone", "plate", "racket", "umbrella"),
+        "target": "holding",
+    },
+    {
+        "subject": "person",
+        "predicate": "using",
+        "objects": ("phone", "racket", "ski", "skateboard", "surfboard"),
+        "target": "holding",
+    },
+]
+
+OBJECT_NAME_ALIASES = {
+    "apple": "fruit",
+    "baby": "person",
+    "berry": "fruit",
+    "bicycle": "bike",
+    "broccoli": "vegetable",
+    "cake": "food",
+    "carrot": "vegetable",
+    "donut": "food",
+    "hotdog": "food",
+    "jet": "plane",
+    "lemon": "fruit",
+    "meat": "food",
+    "pants": "pant",
+    "rail": "railing",
+    "rice": "food",
+    "rider": "person",
+    "road": "street",
+    "sandwich": "food",
+    "stone": "rock",
+    "strawberry": "fruit",
+    "taxi": "car",
+    "teddy": "bear",
+    "television": "screen",
+    "tomato": "vegetable",
+    "tv": "screen",
+    "van": "vehicle",
+    "watermelon": "fruit",
 }
 
 
@@ -171,9 +340,85 @@ def build_index_aliases(ind_to_names, canonical_aliases):
     return idx_aliases
 
 
+def build_triplet_predicate_aliases(class_to_idx, pred_to_idx, object_idx_aliases):
+    aliases = {}
+
+    def class_idx(name):
+        idx = class_to_idx.get(base.normalize_text(name))
+        if idx is None:
+            return None
+        return object_idx_aliases.get(int(idx), int(idx))
+
+    for rule in TRIPLET_PREDICATE_ALIASES:
+        subject_idx = class_idx(rule["subject"])
+        predicate_idx = pred_to_idx.get(base.normalize_text(rule["predicate"]))
+        target_idx = pred_to_idx.get(base.normalize_text(rule["target"]))
+        if subject_idx is None or predicate_idx is None or target_idx is None:
+            continue
+        for object_name in rule["objects"]:
+            object_idx = class_idx(object_name)
+            if object_idx is not None:
+                aliases[(subject_idx, predicate_idx, object_idx)] = target_idx
+
+    return aliases
+
+
+def canonicalize_triplet_predicate_idx(subject_label, predicate_idx, object_label, triplet_predicate_aliases):
+    key = (int(subject_label), int(predicate_idx), int(object_label))
+    canonical = triplet_predicate_aliases.get(key)
+    if canonical is None:
+        return int(predicate_idx), False
+    return int(canonical), int(canonical) != int(predicate_idx)
+
+
+def load_object_name_aliases(r1_root, valid_classes):
+    aliases = dict(OBJECT_NAME_ALIASES)
+    synonym_path = os.path.join(r1_root, "src", "vg_synonyms.py")
+    if os.path.exists(synonym_path):
+        text = Path(synonym_path).read_text(encoding="utf-8")
+        match = re.search(r"obj2vg_list\s*=\s*(\[.*?\])\s*\n", text, flags=re.S)
+        if match:
+            try:
+                obj2vg_list = ast.literal_eval(match.group(1))
+            except Exception:
+                obj2vg_list = []
+            for item in obj2vg_list:
+                source = base.normalize_text(item.get("source", ""))
+                target = base.normalize_text(item.get("target", ""))
+                if source and target in valid_classes:
+                    aliases[source] = target
+
+    return {
+        base.normalize_text(source): base.normalize_text(target)
+        for source, target in aliases.items()
+        if base.normalize_text(target) in valid_classes
+    }
+
+
+def canonicalize_object_name(name, class_to_idx, object_name_aliases):
+    name = base.normalize_text(name)
+    if name in class_to_idx:
+        return name, False
+    alias = object_name_aliases.get(name)
+    if alias in class_to_idx:
+        return alias, True
+    return name, False
+
+
 def canonicalize_predicate_name(name, pred_to_idx):
     canonical = PREDICATE_CANONICAL_ALIASES.get(base.normalize_text(name), name)
     return canonical if canonical in pred_to_idx else name
+
+
+def normalize_structured_predicate_name(name, pred_to_idx, synonym_map):
+    pred_name = base.normalize_predicate_name(name, pred_to_idx, synonym_map)
+    if pred_name is not None:
+        return pred_name, False
+
+    alias = PREDICATE_NAME_ALIASES.get(base.normalize_text(name))
+    if alias in pred_to_idx:
+        return alias, True
+    return None, False
 
 
 def convert_pred_box(box, pred_box_scale, image_info, coord_mode):
@@ -209,11 +454,20 @@ def convert_pred_box(box, pred_box_scale, image_info, coord_mode):
 
 
 class StanfordFilteredVGDataset:
-    def __init__(self, vg_dir, image_ids, split_id=0, object_idx_aliases=None, predicate_idx_aliases=None):
+    def __init__(
+        self,
+        vg_dir,
+        image_ids,
+        split_id=0,
+        object_idx_aliases=None,
+        predicate_idx_aliases=None,
+        triplet_predicate_aliases=None,
+    ):
         self.vg_dir = vg_dir
         self.ind_to_classes, self.ind_to_predicates = base.build_ind_to_names(vg_dir)
         self.object_idx_aliases = object_idx_aliases or {}
         self.predicate_idx_aliases = predicate_idx_aliases or {}
+        self.triplet_predicate_aliases = triplet_predicate_aliases or {}
         self.ids = []
         self.annotations = []
 
@@ -263,6 +517,18 @@ class StanfordFilteredVGDataset:
                     predicates = all_predicates[first_rel : last_rel + 1]
                     predicates = np.asarray(
                         [self.predicate_idx_aliases.get(int(pred), int(pred)) for pred in predicates],
+                        dtype=np.int64,
+                    )
+                    predicates = np.asarray(
+                        [
+                            canonicalize_triplet_predicate_idx(
+                                relation_labels[int(subj_idx)],
+                                pred,
+                                relation_labels[int(obj_idx)],
+                                self.triplet_predicate_aliases,
+                            )[0]
+                            for (subj_idx, obj_idx), pred in zip(rel_obj_idx, predicates)
+                        ],
                         dtype=np.int64,
                     )
                     edges = np.column_stack((rel_obj_idx, predicates)).astype(np.int64)
@@ -325,10 +591,12 @@ def build_prediction(
     class_to_idx,
     pred_to_idx,
     synonym_map,
+    object_name_aliases,
     pred_box_scale,
     image_info_map,
     coord_mode,
     object_idx_aliases,
+    triplet_predicate_aliases,
 ):
     stats = base.Counter()
     image_id = parse_object_image_id(record)
@@ -356,11 +624,13 @@ def build_prediction(
         if isinstance(obj, (list, tuple)) and len(obj) == 2:
             obj_id = str(obj[0]).strip()
             category = base.strip_instance_id(obj_id)
+            category, used_object_name_alias = canonicalize_object_name(category, class_to_idx, object_name_aliases)
             label = class_to_idx.get(category)
             box = convert_pred_box(obj[1], pred_box_scale, image_info, coord_mode)
         elif isinstance(obj, dict):
             obj_id = str(obj.get("id", "")).strip()
             category = base.strip_instance_id(obj.get("category") or obj_id)
+            category, used_object_name_alias = canonicalize_object_name(category, class_to_idx, object_name_aliases)
             label = class_to_idx.get(category)
             box = convert_pred_box(obj.get("box") or obj.get("bbox"), pred_box_scale, image_info, coord_mode)
         else:
@@ -383,6 +653,8 @@ def build_prediction(
         pred_boxes.append(box)
         pred_labels.append(label)
         pred_relation_labels.append(object_idx_aliases.get(int(label), int(label)))
+        if used_object_name_alias:
+            stats["object_name_alias_used"] += 1
 
     relation_rows = []
     for rel_order, rel in enumerate(relationships):
@@ -407,12 +679,26 @@ def build_prediction(
             stats["self_relationship"] += 1
             continue
 
-        pred_name = base.normalize_predicate_name(predicate_raw, pred_to_idx, synonym_map)
+        pred_name, used_predicate_name_alias = normalize_structured_predicate_name(
+            predicate_raw,
+            pred_to_idx,
+            synonym_map,
+        )
         if pred_name is None:
             stats["unknown_predicate"] += 1
             continue
         pred_name = canonicalize_predicate_name(pred_name, pred_to_idx)
-        relation_rows.append((rel_order, subj_idx, obj_idx, pred_to_idx[pred_name]))
+        pred_idx, used_triplet_predicate_alias = canonicalize_triplet_predicate_idx(
+            pred_relation_labels[subj_idx],
+            pred_to_idx[pred_name],
+            pred_relation_labels[obj_idx],
+            triplet_predicate_aliases,
+        )
+        relation_rows.append((rel_order, subj_idx, obj_idx, pred_idx))
+        if used_predicate_name_alias:
+            stats["predicate_name_alias_used"] += 1
+        if used_triplet_predicate_alias:
+            stats["triplet_predicate_alias_used"] += 1
 
     if not pred_boxes:
         stats["empty_objects_after_filter"] += 1
@@ -457,7 +743,15 @@ def build_prediction(
     return image_id, base.with_stats(pred, stats)
 
 
-def load_predictions(args, class_to_idx, pred_to_idx, synonym_map, object_idx_aliases):
+def load_predictions(
+    args,
+    class_to_idx,
+    pred_to_idx,
+    synonym_map,
+    object_name_aliases,
+    object_idx_aliases,
+    triplet_predicate_aliases,
+):
     predictions = OrderedDict()
     stats = base.Counter()
     image_info_map = base.build_image_info_map(args.vg_dir)
@@ -476,10 +770,12 @@ def load_predictions(args, class_to_idx, pred_to_idx, synonym_map, object_idx_al
                 class_to_idx,
                 pred_to_idx,
                 synonym_map,
+                object_name_aliases,
                 args.pred_box_scale,
                 image_info_map,
                 args.coord_mode,
                 object_idx_aliases,
+                triplet_predicate_aliases,
             )
             if image_id is None:
                 stats.update(pred_or_stats)
@@ -536,12 +832,23 @@ def main():
     class_to_idx = {base.normalize_text(name): idx for idx, name in enumerate(ind_to_classes)}
     class_to_idx.pop("__background__", None)
     pred_to_idx = {base.normalize_text(name): idx for idx, name in enumerate(ind_to_predicates)}
+    valid_classes = set(class_to_idx.keys())
     valid_predicates = set(pred_to_idx.keys()) - {"__background__"}
     synonym_map = {} if args.no_synonyms else base.load_predicate_synonyms(args.r1_root, valid_predicates)
+    object_name_aliases = {} if args.no_synonyms else load_object_name_aliases(args.r1_root, valid_classes)
     object_idx_aliases = build_index_aliases(ind_to_classes, OBJECT_CANONICAL_ALIASES)
     predicate_idx_aliases = build_index_aliases(ind_to_predicates, PREDICATE_CANONICAL_ALIASES)
+    triplet_predicate_aliases = build_triplet_predicate_aliases(class_to_idx, pred_to_idx, object_idx_aliases)
 
-    predictions, parse_stats = load_predictions(args, class_to_idx, pred_to_idx, synonym_map, object_idx_aliases)
+    predictions, parse_stats = load_predictions(
+        args,
+        class_to_idx,
+        pred_to_idx,
+        synonym_map,
+        object_name_aliases,
+        object_idx_aliases,
+        triplet_predicate_aliases,
+    )
     if not predictions:
         raise RuntimeError("No valid predictions were parsed.")
 
@@ -552,6 +859,7 @@ def main():
         split_to_id[args.split],
         object_idx_aliases=object_idx_aliases,
         predicate_idx_aliases=predicate_idx_aliases,
+        triplet_predicate_aliases=triplet_predicate_aliases,
     )
     predictions = OrderedDict((image_id, predictions.get(image_id)) for image_id in dataset.ids)
     patched_empty = base.patch_empty_graphs_for_zero_recall(predictions, dataset, len(ind_to_predicates))
@@ -616,8 +924,11 @@ def main():
         "avg_pred_triplets_per_image": avg_pred_triplets,
         "num_empty_or_missing_predictions_patched_as_zero_recall": patched_empty,
         "parse_stats": dict(parse_stats),
+        "object_name_aliases": object_name_aliases,
         "object_canonical_aliases": OBJECT_CANONICAL_ALIASES,
+        "predicate_name_aliases": PREDICATE_NAME_ALIASES,
         "predicate_canonical_aliases": PREDICATE_CANONICAL_ALIASES,
+        "triplet_predicate_aliases": TRIPLET_PREDICATE_ALIASES,
         "metrics": metrics,
     }
 
